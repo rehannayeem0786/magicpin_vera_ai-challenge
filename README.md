@@ -16,8 +16,8 @@ Context Extractor ──→ Derived insights + SPECIFICITY ANCHORS
         │               (pre-computed citable facts: peer gaps, YoY trends,
         │                review quotes, slots, offer prices — never raw JSON)
         ↓
-LLM Composer ──→ Mistral chain: mistral-large-latest → mistral-medium-latest → open-mistral-nemo
-        │          (deadline-aware ≤24s budget; auto-fallback under rate limits)
+LLM Composer ──→ Mistral chain: mistral-medium-latest → mistral-large-latest → open-mistral-nemo
+        │          (deadline-aware ≤24s budget, per-model cap; auto-fallback under load/outage)
         ↓
 Validator ──→ taboos, CTA shape/placement, send_as, markdown leak, length,
         │      repetition vs history, NUMERIC PROVENANCE (every ≥100 number
@@ -37,7 +37,7 @@ Conversation State Machine ──→ Auto-reply exit ≤2 turns, intent→action
 | **Specificity anchors engine** | Pre-computes verified fact-lines (CTR vs peer median, "+34% YoY thali searches", exact slot labels, ₹ offer prices) injected as *the only numbers the LLM may cite* | Maximum Specificity score with zero fabrication risk |
 | **Numeric provenance check** | Regex-extracts every ≥100 figure from output; any not found in the 4 context JSONs triggers an LLM repair re-write, then deterministic sentence-drop | Zero anti-hallucination penalties |
 | **Trigger-specific prompts + gold exemplars** | 15+ variants each ending in a pattern-to-emulate exemplar modeled on the brief's Appendix A/B | Consistent 10/10 message shape across kinds |
-| **Model fallback chain** | `mistral-large-latest` primary; falls to medium/nemo under load — never dead | Frontier copy quality AND reliability |
+| **Model fallback chain** | `mistral-medium-latest` primary (~1-3s); falls to large/nemo under load or model outage, with a per-model timeout cap so one hanging model can never starve the chain — never dead | Frontier copy quality AND reliability |
 | **Deadline-aware parallel tick** | Compositions run in bounded waves (max 4 concurrent) under a shared 26s guard; one action per merchant per tick (urgency-wins) | Survives 30s contract even with 50 triggers; no spam penalty |
 | **Auto-reply detection** | Canned-pattern regexes + verbatim repetition + **request-free filler pairs** (autoresponders paraphrase freely but never ask for prices/details/slots — two consecutive request-free merchant messages ⇒ exit ≤2 turns; humans who ask anything are always protected) | Passes replay/auto-reply probes first try |
 | **Intent transition hardening** | "I want to join", "count me in", "interested", Hinglish "kardo" → immediate action mode | Directly fixes production Vera's #1 handoff failure |
@@ -68,7 +68,7 @@ Each trigger kind targets 2-3 of these levers:
 
 ### Tradeoffs
 
-1. **Mistral large (paid) vs free models**: We use `mistral-large-latest` as the primary composer — copy quality directly drives all five rubric dimensions. The chain degrades gracefully to medium/nemo if quota runs dry mid-test. Measured: ~8s median latency on large, well inside the 30s endpoint contract.
+1. **Mistral medium (paid) as primary vs large**: We promote `mistral-medium-latest` to primary composer — measured ~1-3s vs large's current platform-side instability (large hung 60s+ during testing; it stays in the chain and is auto-promoted by `MISTRAL_MODEL` env if desired). Copy quality still drives all five rubric dimensions, and the chain degrades gracefully to large/nemo under quota pressure. Well inside the 30s endpoint contract.
 
 2. **In-memory state vs persistent storage**: In-memory dicts for context/conversation state are sufficient for the 60-min test window (brief §2.1 explicitly allows it) and `/v1/teardown` wipes everything for §11 compliance.
 
@@ -139,7 +139,7 @@ pip install -r requirements.txt
 
 # Configure LLM access (.env):
 # MISTRAL_API_KEY=your_key_here      # required
-# MISTRAL_MODEL=mistral-large-latest # optional override (chain falls back automatically)
+# MISTRAL_MODEL=mistral-medium-latest # optional override (chain falls back automatically)
 # BOT_PORT=8080                      # optional
 ```
 
@@ -181,7 +181,7 @@ python verify_submission.py --strict
 
 ## Tech Stack
 
-- **LLM**: Mistral API — `mistral-large-latest` (primary) with automatic fallback to `mistral-medium-latest`, then `open-mistral-nemo`
+- **LLM**: Mistral API — `mistral-medium-latest` (primary) with automatic fallback to `mistral-large-latest`, then `open-mistral-nemo`; per-model timeout cap keeps one hung model from starving the chain
 - **Framework**: FastAPI + Uvicorn
 - **HTTP Client**: httpx (async)
 - **Testing**: pytest (FastAPI TestClient)

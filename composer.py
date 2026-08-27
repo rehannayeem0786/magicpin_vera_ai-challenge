@@ -34,9 +34,13 @@ logger = logging.getLogger("vera_pro")
 
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 _env_model = os.getenv("MISTRAL_MODEL", "").strip()
+# Chain order: medium is primary — measured ~0.9-3s vs large's instability
+# (2026-08: mistral-large-latest hung 60s+ platform-side, see probe logs).
+# medium → large → nemo keeps frontier quality in the chain while
+# guaranteeing a sub-10s composition in the healthy path.
 MODEL_CHAIN = [m for m in [
-    _env_model or "mistral-large-latest",
-    "mistral-medium-latest",
+    _env_model or "mistral-medium-latest",
+    "mistral-large-latest",
     "open-mistral-nemo",
 ] if m]
 PRIMARY_MODEL = MODEL_CHAIN[0]
@@ -90,7 +94,9 @@ async def _call_llm(
             }
             for attempt in range(retries + 1):
                 try:
-                    call_timeout = max(4.0, min(remaining, budget_s))
+                    # Per-model cap: no single hanging model may consume the
+                    # whole budget — the next chain model must always get a turn.
+                    call_timeout = max(4.0, min(remaining, budget_s, budget_s * 0.45))
                     resp = await client.post(
                         MISTRAL_URL, headers=headers, json=body,
                         timeout=call_timeout,
