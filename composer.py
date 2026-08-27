@@ -45,6 +45,11 @@ MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 # Whole-request budget — endpoints must respond within 30s
 LLM_BUDGET_S = float(os.getenv("LLM_BUDGET_S", "24"))
 
+# Last LLM failure signature — surfaced in the fallback rationale so the
+# exact failure mode (bad key / 401 / timeout / egress error) is visible
+# in tick & reply responses without needing server log access.
+_last_llm_error: str = ""
+
 
 async def _call_llm(
     system_prompt: str,
@@ -54,7 +59,9 @@ async def _call_llm(
     max_tokens: int = 500,
 ) -> str | None:
     """Call Mistral API trying each model in MODEL_CHAIN within a time budget."""
+    global _last_llm_error
     if not MISTRAL_API_KEY:
+        _last_llm_error = "no MISTRAL_API_KEY configured"
         logger.error("No MISTRAL_API_KEY configured!")
         return None
 
@@ -69,6 +76,7 @@ async def _call_llm(
         for model in MODEL_CHAIN:
             remaining = budget_s - (time.monotonic() - started)
             if remaining < 4.0:
+                _last_llm_error = "LLM time budget exhausted"
                 logger.warning("LLM time budget exhausted; stopping model chain")
                 break
             body = {
@@ -91,22 +99,28 @@ async def _call_llm(
                         content = resp.json()["choices"][0]["message"]["content"]
                         elapsed = time.monotonic() - started
                         logger.info(f"LLM OK via {model} in {elapsed:.1f}s")
+                        _last_llm_error = ""
                         return content
                     elif resp.status_code == 401:
+                        _last_llm_error = "401 auth failed — invalid API key"
                         logger.error("Mistral auth failed (401) — check API key")
                         return None
                     elif resp.status_code == 429:
+                        _last_llm_error = f"{model} 429 rate limited"
                         logger.warning(f"{model} rate limited")
                         import asyncio
                         await asyncio.sleep(0.8)
                         continue  # retry same model once
                     else:
+                        _last_llm_error = f"{model} HTTP {resp.status_code}: {resp.text[:80]}"
                         logger.warning(f"{model} error {resp.status_code}: {resp.text[:150]}")
                         break  # fall to next model in chain
                 except (httpx.TimeoutException, httpx.ReadTimeout):
+                    _last_llm_error = f"{model} timeout after {call_timeout:.0f}s"
                     logger.warning(f"{model} timeout after {call_timeout:.0f}s")
                     break  # tighter budget — move to next model immediately
                 except Exception as e:
+                    _last_llm_error = f"{model} {type(e).__name__}: {str(e)[:80]}"
                     logger.warning(f"{model} request error: {e}")
                     break
 
@@ -472,7 +486,10 @@ If you cite any number, it must come from the context above or the conversation 
                 "cta": "open_ended",
                 "send_as": "merchant_on_behalf",
                 "suppression_key": trig.get("suppression_key", f"fallback:{kind}"),
-                "rationale": "Fallback composition — LLM unavailable",
+                "rationale": (
+                    "Fallback composition — LLM unavailable"
+                    + (f" [{_last_llm_error[:100]}]" if _last_llm_error else "")
+                ),
             }
         else:
             greeting = owner or name
@@ -485,7 +502,10 @@ If you cite any number, it must come from the context above or the conversation 
                 "cta": "open_ended",
                 "send_as": "vera",
                 "suppression_key": trig.get("suppression_key", f"fallback:{kind}"),
-                "rationale": "Fallback composition — LLM unavailable",
+                "rationale": (
+                    "Fallback composition — LLM unavailable"
+                    + (f" [{_last_llm_error[:100]}]" if _last_llm_error else "")
+                ),
             }
 
     def _fallback_reply(self, intent: str, merch: dict) -> dict:
