@@ -1,0 +1,33 @@
+# ── secrets ──────────────────────────────────────────────
+.env
+.env.*
+*.key
+
+# ── python runtime ───────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# ── vercel / tooling state ───────────────────────────────
+.vercel/
+node_modules/
+
+# ── local logs & scratch scripts ─────────────────────────
+final_scores.txt
+final_err.txt
+judge_final.txt
+*.log
+_e2e_check.py
+_trace.py
+_fix_canned.py
+_probe_test.py
+
+# ── editor / OS noise ────────────────────────────────────
+.vscode/
+.idea/
+.claude/
+Thumbs.db
+.DS_Store
