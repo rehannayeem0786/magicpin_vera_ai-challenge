@@ -39,6 +39,7 @@ Conversation State Machine ──→ Auto-reply exit ≤2 turns, intent→action
 | **Trigger-specific prompts + gold exemplars** | 15+ variants each ending in a pattern-to-emulate exemplar modeled on the brief's Appendix A/B | Consistent 10/10 message shape across kinds |
 | **Model fallback chain** | `mistral-medium-latest` primary (~1-3s); falls to large/nemo under load or model outage, with a per-model timeout cap so one hanging model can never starve the chain — never dead | Frontier copy quality AND reliability |
 | **Deadline-aware parallel tick** | Compositions run in bounded waves (max 4 concurrent) under a shared 26s guard; one action per merchant per tick (urgency-wins) | Survives 30s contract even with 50 triggers; no spam penalty |
+| **Shared-state store (serverless-safe)** | In-memory working cache backed by a version-merged Upstash Redis blob + atomic `SETNX` suppression claims — parallel judge requests hitting different serverless instances always see the full context state; no fragmentation, no double-sends | Every tick/reply runs with complete state; mid-test context injections are always picked up |
 | **Auto-reply detection** | Canned-pattern regexes + verbatim repetition + **request-free filler pairs** (autoresponders paraphrase freely but never ask for prices/details/slots — two consecutive request-free merchant messages ⇒ exit ≤2 turns; humans who ask anything are always protected) | Passes replay/auto-reply probes first try |
 | **Intent transition hardening** | "I want to join", "count me in", "interested", Hinglish "kardo" → immediate action mode | Directly fixes production Vera's #1 handoff failure |
 | **Anti-repetition memory** | Per-merchant deque of last sent bodies fed into every new composition ("vary angle") | No verbatim-repeat penalties across ticks |
@@ -70,7 +71,7 @@ Each trigger kind targets 2-3 of these levers:
 
 1. **Mistral medium (paid) as primary vs large**: We promote `mistral-medium-latest` to primary composer — measured ~1-3s vs large's current platform-side instability (large hung 60s+ during testing; it stays in the chain and is auto-promoted by `MISTRAL_MODEL` env if desired). Copy quality still drives all five rubric dimensions, and the chain degrades gracefully to large/nemo under quota pressure. Well inside the 30s endpoint contract.
 
-2. **In-memory state vs persistent storage**: In-memory dicts for context/conversation state are sufficient for the 60-min test window (brief §2.1 explicitly allows it) and `/v1/teardown` wipes everything for §11 compliance.
+2. **In-memory state vs persistent storage**: The working state lives in in-memory dicts for speed, backed by a shared Upstash Redis blob (`state_store.py`) when deployed serverless — every request hydrates from and merge-saves into Redis, so parallel instances share one truth (context version-merge prevents lost pushes; atomic SETNX claims prevent double-sends). `/v1/teardown` wipes both memory and Redis for §11 compliance.
 
 3. **15+ specialized prompts vs one generic prompt**: More surface area to maintain, but per-kind lever optimization plus gold exemplars measurably outperforms a generic template.
 
@@ -141,6 +142,10 @@ pip install -r requirements.txt
 # MISTRAL_API_KEY=your_key_here      # required
 # MISTRAL_MODEL=mistral-medium-latest # optional override (chain falls back automatically)
 # BOT_PORT=8080                      # optional
+#
+# Shared state on serverless (optional but recommended on Vercel):
+# UPSTASH_REDIS_REST_URL=https://<db>.upstash.io    # enables cross-instance state
+# UPSTASH_REDIS_REST_TOKEN=your_token               # without these, memory-only
 ```
 
 ## Run
@@ -184,5 +189,6 @@ python verify_submission.py --strict
 - **LLM**: Mistral API — `mistral-medium-latest` (primary) with automatic fallback to `mistral-large-latest`, then `open-mistral-nemo`; per-model timeout cap keeps one hung model from starving the chain
 - **Framework**: FastAPI + Uvicorn
 - **HTTP Client**: httpx (async)
+- **Shared state**: Upstash Redis (REST) with in-memory fallback — version-merged blob + atomic suppression claims across serverless instances
 - **Testing**: pytest (FastAPI TestClient)
 - **Language**: Python 3.11+

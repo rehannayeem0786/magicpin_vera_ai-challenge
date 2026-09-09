@@ -116,6 +116,42 @@ class ConversationState:
             "auto_reply_count": self.auto_reply_count,
         }
 
+    def serialize(self) -> dict:
+        """Full serialization for shared-state persistence (state_store.py)."""
+        return {
+            "conversation_id": self.conversation_id,
+            "merchant_id": self.merchant_id,
+            "customer_id": self.customer_id,
+            "state": self.state,
+            "turn_count": self.turn_count,
+            "turns": self.turns,
+            "auto_reply_count": self.auto_reply_count,
+            "unanswered_nudge_count": self.unanswered_nudge_count,
+            "detected_language": self.detected_language,
+            "trigger_id": self.trigger_id,
+            "seen_msgs": self.seen_msgs,
+            "last_msg_request_free": self.last_msg_request_free,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "ConversationState":
+        """Rebuild a conversation from its serialized form."""
+        obj = cls(
+            data.get("conversation_id", ""),
+            data.get("merchant_id", ""),
+            data.get("customer_id"),
+        )
+        obj.state = data.get("state", "initiated")
+        obj.turn_count = int(data.get("turn_count", 0))
+        obj.turns = list(data.get("turns", []))
+        obj.auto_reply_count = int(data.get("auto_reply_count", 0))
+        obj.unanswered_nudge_count = int(data.get("unanswered_nudge_count", 0))
+        obj.detected_language = data.get("detected_language")
+        obj.trigger_id = data.get("trigger_id")
+        obj.seen_msgs = dict(data.get("seen_msgs", {}))
+        obj.last_msg_request_free = bool(data.get("last_msg_request_free", False))
+        return obj
+
 
 class ConversationManager:
     """
@@ -125,6 +161,18 @@ class ConversationManager:
 
     def __init__(self):
         self.conversations: dict[str, ConversationState] = {}
+
+    def export(self) -> dict:
+        """Serialize all conversations for shared-state persistence."""
+        return {cid: cs.serialize() for cid, cs in self.conversations.items()}
+
+    def import_state(self, data: dict) -> None:
+        """Restore conversations from a shared-state blob export."""
+        for cid, cs_data in (data or {}).items():
+            try:
+                self.conversations[cid] = ConversationState.deserialize(cs_data)
+            except Exception as e:
+                logger.warning(f"Conversation restore failed for {cid}: {e}")
 
     def get_or_create(
         self, conversation_id: str, merchant_id: str, customer_id: str | None = None

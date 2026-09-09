@@ -112,6 +112,30 @@ def validate_composition(
     return is_valid, issues
 
 
+# Characters LLMs occasionally emit that crash strict codecs or render
+# badly in WhatsApp text surfaces (charmap crash seen live with \u2009).
+_WS_MAP = {
+    "\u2009": " ", "\u200a": " ", "\u2007": " ", "\u2008": " ",
+    "\u2005": " ", "\u2006": " ", "\u202f": " ", "\u00a0": " ",
+    "\u200b": "", "\ufeff": "",
+}
+
+
+def normalize_text(text: str) -> str:
+    """Normalize exotic Unicode whitespace to plain spaces.
+
+    Applied to every outbound body so judge parsers with strict encoders
+    never see thin/nbsp/zero-width spaces.
+    """
+    if not text:
+        return text
+    for src, dst in _WS_MAP.items():
+        if src in text:
+            text = text.replace(src, dst)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
 def detect_auto_reply(message: str, conversation_history: list[dict] | None = None) -> bool:
     """
     Detect if a merchant's reply is an auto-reply.

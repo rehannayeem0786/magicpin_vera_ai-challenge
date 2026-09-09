@@ -10,7 +10,7 @@ Exposes 5 endpoints per the testing brief:
   GET  /v1/metadata  — bot identity
 
 Architecture:
-  Groq (primary) + OpenRouter (fallback) for LLM composition
+  Mistral LLM chain (medium primary → large → nemo) for composition
   Trigger-specific prompt routing for 15+ trigger kinds
   Conversation state machine for multi-turn handling
   Post-composition validation for quality assurance
@@ -37,7 +37,7 @@ load_dotenv()
 
 from composer import EngagementComposer
 from conversation_handlers import ConversationManager
-from validators import detect_auto_reply, detect_intent
+from validators import detect_auto_reply, detect_intent, normalize_text
 
 # ─────────────────────────────────────────────────────────────────────
 # Logging setup
@@ -74,6 +74,61 @@ sent_bodies: dict[str, deque] = {}
 
 # Import primary model name for metadata reporting
 from composer import PRIMARY_MODEL
+
+# Shared-state bridge: on Vercel Fluid Compute, parallel judge requests can
+# land on different instances. When Upstash Redis is configured, every
+# request hydrates from / merges into one shared blob so no instance ever
+# runs with stale or missing contexts. Without Redis → memory-only (local).
+import state_store
+
+
+def _export_blob() -> dict:
+    """Snapshot the in-memory working state for the shared blob."""
+    return {
+        "contexts": {
+            f"{scope}|{cid}": entry for (scope, cid), entry in contexts.items()
+        },
+        "conversations": conversations_mgr.export(),
+        "sent_bodies": {mid: list(dq) for mid, dq in sent_bodies.items()},
+        "suppression": sorted(used_suppression_keys),
+    }
+
+
+def _apply_blob(blob: dict) -> None:
+    """Merge a shared blob onto the local working cache."""
+    if not blob:
+        return
+    for key, entry in blob.get("contexts", {}).items():
+        scope, _, cid = key.rpartition("|")
+        if not scope or not cid:
+            continue
+        tuple_key = (scope, cid)
+        existing = contexts.get(tuple_key)
+        if not existing or int(entry.get("version", 0)) >= int(existing["version"]):
+            contexts[tuple_key] = entry
+    conversations_mgr.import_state(blob.get("conversations", {}))
+    for mid, bodies in blob.get("sent_bodies", {}).items():
+        dq = sent_bodies.setdefault(mid, deque(maxlen=5))
+        for b in bodies:
+            if b not in dq:
+                dq.append(b)
+    used_suppression_keys.update(blob.get("suppression", []))
+
+
+async def _hydrate_state() -> None:
+    """Pull shared state onto the local cache before processing a request."""
+    if not state_store.is_remote():
+        return
+    blob = await state_store.load_blob()
+    if blob:
+        _apply_blob(blob)
+
+
+async def _persist_state() -> None:
+    """Merge local mutations back into the shared blob (version-safe)."""
+    if not state_store.is_remote():
+        return
+    await state_store.save_blob(_export_blob())
 
 # ─────────────────────────────────────────────────────────────────────
 # Pydantic models
@@ -133,6 +188,7 @@ def _count_contexts() -> dict[str, int]:
 @app.get("/v1/healthz")
 async def healthz():
     """Liveness probe — judge polls every 60s."""
+    await _hydrate_state()
     return {
         "status": "ok",
         "uptime_seconds": int(time.time() - START_TIME),
@@ -170,11 +226,14 @@ async def teardown():
     conversations_mgr.conversations.clear()
     used_suppression_keys.clear()
     sent_bodies.clear()
-    logger.info(f"TEARDOWN: wiped {n_contexts} contexts, {n_convs} conversations")
+    remote_keys = await state_store.wipe_remote()
+    logger.info(f"TEARDOWN: wiped {n_contexts} contexts, {n_convs} conversations, "
+                f"{remote_keys} remote keys")
     return {
         "wiped": True,
         "contexts_removed": n_contexts,
         "conversations_removed": n_convs,
+        "remote_keys_wiped": remote_keys,
         "wiped_at": datetime.utcnow().isoformat() + "Z",
     }
 
@@ -216,6 +275,7 @@ async def push_context(body: ContextPush):
     }
 
     logger.info(f"Context stored: {body.scope}/{body.context_id} v{body.version}")
+    await _persist_state()
 
     return {
         "accepted": True,
@@ -238,6 +298,7 @@ async def tick(body: TickRequest):
     """
     started = time.monotonic()
     actions = []
+    await _hydrate_state()
 
     # ── Phase 1: resolve candidates (no LLM) ──
     candidates = []
@@ -337,7 +398,16 @@ async def tick(body: TickRequest):
         trig_id = cand["trig_id"]
         merchant_id = cand["candidate_merchant_id"]
         conv_id = f"conv_{merchant_id}_{trig_id}_{int(time.time())}"
-        body_text = result["body"]
+
+        # Atomic cross-instance claim — parallel ticks can never double-send
+        if cand["suppression_key"] and not await state_store.claim_suppression(
+            cand["suppression_key"]
+        ):
+            logger.info(f"Suppression {cand['suppression_key']} already claimed "
+                        f"by another instance")
+            continue
+
+        body_text = normalize_text(result["body"])
         template_params = _extract_template_params(body_text, cand["merchant"])
 
         conversations_mgr.get_or_create(conv_id, merchant_id, cand["customer_id"])
@@ -370,6 +440,7 @@ async def tick(body: TickRequest):
     logger.info(f"Tick: {len(actions)} actions from "
                 f"{len(body.available_triggers)} triggers "
                 f"in {time.monotonic() - started:.1f}s")
+    await _persist_state()
     return {"actions": actions}
 
 
@@ -382,6 +453,7 @@ async def reply(body: ReplyRequest):
     conv_id = body.conversation_id
     merchant_id = body.merchant_id or ""
     message = body.message
+    await _hydrate_state()
 
     # Process through conversation state machine
     routing = conversations_mgr.process_incoming(conv_id, message)
@@ -395,6 +467,7 @@ async def reply(body: ReplyRequest):
     # Auto-reply: 2+ times → exit
     if routing["should_end"] and routing["auto_reply_detected"]:
         conversations_mgr.end_conversation(conv_id)
+        await _persist_state()
         return {
             "action": "end",
             "rationale": f"Auto-reply detected {conv_state.get('auto_reply_count', 2)}+ times. Graceful exit.",
@@ -423,6 +496,7 @@ async def reply(body: ReplyRequest):
     # Too many turns → exit
     if routing["should_end"]:
         conversations_mgr.end_conversation(conv_id)
+        await _persist_state()
         return {
             "action": "end",
             "rationale": "Conversation exceeded max turns. Graceful exit.",
@@ -447,7 +521,9 @@ async def reply(body: ReplyRequest):
 
     # Record bot's response
     if action == "send" and result.get("body"):
+        result["body"] = normalize_text(result["body"])
         conversations_mgr.record_bot_send(conv_id, result["body"])
+    await _persist_state()
 
     if action == "end":
         conversations_mgr.end_conversation(conv_id)
