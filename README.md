@@ -1,5 +1,7 @@
 # Vera Pro v2 — magicpin AI Challenge Submission
 
+> **Live deployment:** https://magicpinveraai-challenge.vercel.app — all endpoints verified end-to-end (`healthz`, `metadata`, `context`, `tick`, `reply`, `teardown`) with shared Redis state active (`shared_state: true`).
+
 ## Approach
 
 **Vera Pro** is a 4-context composition engine with a **zero-flaw guarantee pipeline**: every message passes extract → anchor → compose → validate → LLM-repair → deterministic-repair before shipping. Unlike single-prompt bots, it uses **trigger-specific prompt routing** with per-trigger gold exemplars and a **numeric-provenance anti-hallucination engine**.
@@ -37,9 +39,10 @@ Conversation State Machine ──→ Auto-reply exit ≤2 turns, intent→action
 | **Specificity anchors engine** | Pre-computes verified fact-lines (CTR vs peer median, "+34% YoY thali searches", exact slot labels, ₹ offer prices) injected as *the only numbers the LLM may cite* | Maximum Specificity score with zero fabrication risk |
 | **Numeric provenance check** | Regex-extracts every ≥100 figure from output; any not found in the 4 context JSONs triggers an LLM repair re-write, then deterministic sentence-drop | Zero anti-hallucination penalties |
 | **Trigger-specific prompts + gold exemplars** | 15+ variants each ending in a pattern-to-emulate exemplar modeled on the brief's Appendix A/B | Consistent 10/10 message shape across kinds |
-| **Model fallback chain** | `mistral-medium-latest` primary (~1-3s); falls to large/nemo under load or model outage, with a per-model timeout cap so one hanging model can never starve the chain — never dead | Frontier copy quality AND reliability |
+| **Model fallback chain** | `mistral-medium-latest` primary (~1-3s); falls to large/nemo under load or model outage, with a per-model timeout cap so one hanging model can never starve the chain. **Adaptive tier handling**: a model returning 403 `tier_not_allowed` is auto-disabled for the process lifetime, and free-tier keys are paced at ≥1 req/sec. **Tolerant JSON parsing** (`strict=False`) accepts smaller models' pretty-printed output with unescaped newlines | Frontier copy quality AND reliability — verified across model outages, tier blocks, and rate limits |
 | **Deadline-aware parallel tick** | Compositions run in bounded waves (max 4 concurrent) under a shared 26s guard; one action per merchant per tick (urgency-wins) | Survives 30s contract even with 50 triggers; no spam penalty |
 | **Shared-state store (serverless-safe)** | In-memory working cache backed by a version-merged Upstash Redis blob + atomic `SETNX` suppression claims — parallel judge requests hitting different serverless instances always see the full context state; no fragmentation, no double-sends | Every tick/reply runs with complete state; mid-test context injections are always picked up |
+| **Unicode hardening** | `normalize_text()` strips thin/nbsp/zero-width spaces from every outbound body — one live failure had an LLM-emitted `\u2009` crash a strict charmap codec | Judge parsers with strict encoders never see exotic Unicode |
 | **Auto-reply detection** | Canned-pattern regexes + verbatim repetition + **request-free filler pairs** (autoresponders paraphrase freely but never ask for prices/details/slots — two consecutive request-free merchant messages ⇒ exit ≤2 turns; humans who ask anything are always protected) | Passes replay/auto-reply probes first try |
 | **Intent transition hardening** | "I want to join", "count me in", "interested", Hinglish "kardo" → immediate action mode | Directly fixes production Vera's #1 handoff failure |
 | **Anti-repetition memory** | Per-merchant deque of last sent bodies fed into every new composition ("vary angle") | No verbatim-repeat penalties across ticks |
@@ -115,7 +118,7 @@ The repo already contains the serverless adapter (`api/index.py` + `vercel.json`
 
 1. Push this repo to GitHub.
 2. On [vercel.com](https://vercel.com): **Add New… → Project → Import** the repo (framework preset: **Other**; root dir: repo root).
-3. **Settings → Environment Variables** → add `MISTRAL_API_KEY` (Production) — this must never be committed to git.
+3. **Settings → Environment Variables** → add `MISTRAL_API_KEY` (Production) — this must never be committed to git. For full serverless state sharing, also add `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` from a free [Upstash](https://upstash.com) Redis database (without them the bot runs memory-only per instance).
 4. Deploy → your base URL is `https://<project-name>.vercel.app`.
 5. Smoke test before submitting the URL:
    ```bash
