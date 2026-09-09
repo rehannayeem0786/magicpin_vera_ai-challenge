@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from composer import EngagementComposer
+from validators import normalize_text
 
 
 async def main():
@@ -109,30 +110,46 @@ async def main():
             print(f"  WARNING: Category {cat_slug} not found, skipping")
             continue
 
-        try:
-            result = await composer.compose(category, merchant, trigger, customer)
-            safe_body = result.get('body', '')[:80].encode('ascii', 'replace').decode('ascii')
-            print(f"  [OK] Body ({len(result.get('body', ''))} chars): \"{safe_body}...\"")
-            print(f"    CTA: {result.get('cta')}, Send as: {result.get('send_as')}")
+        # Compose with retries — never ship fallback/error copy in the file.
+        # Fallback copy scores bottom-tier on all 5 rubric dimensions.
+        result = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                result = await composer.compose(category, merchant, trigger, customer)
+                last_err = None
+            except Exception as e:
+                result = None
+                last_err = e
+            if result and "Fallback composition" not in result.get("rationale", ""):
+                break
+            print(f"  [RETRY {attempt + 1}/2] fallback/error — recomposing...")
 
+        if not result or "Fallback composition" in result.get("rationale", ""):
+            print(f"  [FAIL] Still fallback after retries ({last_err})")
             results.append({
                 "test_id": test_id,
-                "body": result.get("body", ""),
-                "cta": result.get("cta", "open_ended"),
-                "send_as": result.get("send_as", "vera"),
-                "suppression_key": result.get("suppression_key", ""),
-                "rationale": result.get("rationale", ""),
-            })
-        except Exception as e:
-            print(f"  [FAIL] Error: {e}")
-            results.append({
-                "test_id": test_id,
-                "body": f"Error composing: {e}",
+                "body": f"__REGEN_NEEDED__{test_id}",
                 "cta": "none",
                 "send_as": "vera",
                 "suppression_key": "",
-                "rationale": f"Composition failed: {e}",
+                "rationale": f"Composition failed after retries: {last_err}",
             })
+            continue
+
+        body_text = normalize_text(result.get("body", ""))
+        safe_body = body_text[:80].encode('ascii', 'replace').decode('ascii')
+        print(f"  [OK] Body ({len(body_text)} chars): \"{safe_body}...\"")
+        print(f"    CTA: {result.get('cta')}, Send as: {result.get('send_as')}")
+
+        results.append({
+            "test_id": test_id,
+            "body": body_text,
+            "cta": result.get("cta", "open_ended"),
+            "send_as": result.get("send_as", "vera"),
+            "suppression_key": result.get("suppression_key", ""),
+            "rationale": result.get("rationale", ""),
+        })
 
     # Write submission.jsonl
     output_path = Path("submission.jsonl")

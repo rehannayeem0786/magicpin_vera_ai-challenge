@@ -10,6 +10,7 @@ import json
 import re
 import time
 import logging
+import asyncio
 import httpx
 from typing import Any
 
@@ -49,6 +50,14 @@ MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 # Whole-request budget — endpoints must respond within 30s
 LLM_BUDGET_S = float(os.getenv("LLM_BUDGET_S", "24"))
 
+# Adaptive model management (free-tier friendly):
+# - a model returning 403 tier_not_allowed is disabled for the process
+#   lifetime (deterministic per API key — never retry it)
+# - a global minimum call interval paces us under 1-req/sec free-tier limits
+_model_disabled: set[str] = set()
+_MIN_CALL_INTERVAL_S = float(os.getenv("LLM_MIN_INTERVAL_S", "1.0"))
+_last_call_ts = 0.0
+
 # Last LLM failure signature — surfaced in the fallback rationale so the
 # exact failure mode (bad key / 401 / timeout / egress error) is visible
 # in tick & reply responses without needing server log access.
@@ -63,7 +72,7 @@ async def _call_llm(
     max_tokens: int = 500,
 ) -> str | None:
     """Call Mistral API trying each model in MODEL_CHAIN within a time budget."""
-    global _last_llm_error
+    global _last_llm_error, _last_call_ts
     if not MISTRAL_API_KEY:
         _last_llm_error = "no MISTRAL_API_KEY configured"
         logger.error("No MISTRAL_API_KEY configured!")
@@ -78,6 +87,8 @@ async def _call_llm(
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(budget_s)) as client:
         for model in MODEL_CHAIN:
+            if model in _model_disabled:
+                continue  # tier-blocked earlier — skip silently
             remaining = budget_s - (time.monotonic() - started)
             if remaining < 4.0:
                 _last_llm_error = "LLM time budget exhausted"
@@ -97,6 +108,11 @@ async def _call_llm(
                     # Per-model cap: no single hanging model may consume the
                     # whole budget — the next chain model must always get a turn.
                     call_timeout = max(4.0, min(remaining, budget_s, budget_s * 0.45))
+                    # Free-tier pacing: >= _MIN_CALL_INTERVAL_S between calls
+                    wait = _MIN_CALL_INTERVAL_S - (time.monotonic() - _last_call_ts)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    _last_call_ts = time.monotonic()
                     resp = await client.post(
                         MISTRAL_URL, headers=headers, json=body,
                         timeout=call_timeout,
@@ -111,6 +127,14 @@ async def _call_llm(
                         _last_llm_error = "401 auth failed — invalid API key"
                         logger.error("Mistral auth failed (401) — check API key")
                         return None
+                    elif resp.status_code == 403:
+                        # Deterministic per-key signal (tier_not_allowed):
+                        # disable this model for the whole process lifetime.
+                        _model_disabled.add(model)
+                        _last_llm_error = f"{model} 403 tier-blocked — auto-disabled"
+                        logger.error(f"{model} unavailable in subscription tier — "
+                                     f"disabled for process lifetime")
+                        break  # next model in chain
                     elif resp.status_code == 429:
                         _last_llm_error = f"{model} 429 rate limited"
                         logger.warning(f"{model} rate limited")
@@ -134,13 +158,18 @@ async def _call_llm(
 
 
 def _parse_json_response(text: str) -> dict | None:
-    """Extract JSON from LLM response, handling markdown code blocks."""
+    """Extract JSON from LLM response, handling markdown code blocks.
+
+    strict=False tolerates literal control characters (raw newlines/tabs)
+    inside string values — smaller chain models (e.g. open-mistral-nemo)
+    emit pretty-printed JSON with unescaped newlines in the body strings.
+    """
     if not text:
         return None
 
     # Try direct parse first
     try:
-        return json.loads(text.strip())
+        return json.loads(text.strip(), strict=False)
     except json.JSONDecodeError:
         pass
 
@@ -155,7 +184,7 @@ def _parse_json_response(text: str) -> dict | None:
         if match:
             try:
                 candidate = match.group(1) if match.lastindex else match.group(0)
-                return json.loads(candidate.strip())
+                return json.loads(candidate.strip(), strict=False)
             except (json.JSONDecodeError, IndexError):
                 continue
 

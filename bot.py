@@ -193,6 +193,7 @@ async def healthz():
         "status": "ok",
         "uptime_seconds": int(time.time() - START_TIME),
         "contexts_loaded": _count_contexts(),
+        "shared_state": state_store.is_remote(),
     }
 
 
