@@ -1,0 +1,11 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": ["."],
+  "include": ["*.py", "api", "tests", "dataset"],
+  "exclude": [".venv", "**/__pycache__", ".pytest_cache", "node_modules"],
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none",
+  "reportUnusedImport": "none",
+  "reportShadowedImports": "none"
+}
