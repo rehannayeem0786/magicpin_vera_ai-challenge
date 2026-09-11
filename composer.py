@@ -1,8 +1,9 @@
 """
 Vera Pro — LLM Composition Engine
 ====================================
-Routes triggers to specialized prompts, calls Mistral API,
-validates output, and returns composed messages.
+Routes triggers to specialized prompts, calls a multi-provider
+OpenAI-compatible LLM chain (groq → cerebras → openrouter), validates
+output, and returns composed messages.
 """
 
 import os
@@ -32,16 +33,13 @@ logger = logging.getLogger("vera_pro")
 # ─────────────────────────────────────────────────────────────────────
 # LLM Client — multi-provider, OpenAI-compatible, priority chain
 #
-# Priority: Groq → Gemini → Cerebras → OpenRouter → Mistral → (local)
+# Priority: Groq → Cerebras → OpenRouter (Gemini also supported via GEMINI_API_KEY)
 # Every provider below exposes an OpenAI-compatible chat-completions
 # endpoint, so one code path serves them all. The chain survives any
 # single provider's outage, quota exhaustion, or rate-limit burst —
 # which is exactly what happens during the judge's 10-req/sec harness.
 # Configure any subset via env vars; the plan is built from what exists.
 # ─────────────────────────────────────────────────────────────────────
-
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
-_env_model = os.getenv("MISTRAL_MODEL", "").strip()
 
 # Whole-request budget — endpoints must respond within 30s
 LLM_BUDGET_S = float(os.getenv("LLM_BUDGET_S", "24"))
@@ -112,19 +110,6 @@ def _build_call_plan() -> list[dict]:
                 "min_interval": float(os.getenv("OPENROUTER_MIN_INTERVAL_S", "1.0")),
             })
 
-    if MISTRAL_API_KEY:
-        mistral_models = [m.strip() for m in [
-            _env_model or "mistral-medium-latest",
-            "mistral-large-latest",
-            "open-mistral-nemo",
-        ] if m.strip()]
-        for m in mistral_models:
-            plan.append({
-                "label": f"mistral:{m}", "base": "https://api.mistral.ai/v1",
-                "key": MISTRAL_API_KEY, "model": m,
-                "min_interval": float(os.getenv("LLM_MIN_INTERVAL_S", "1.05")),
-            })
-
     return plan
 
 
@@ -153,7 +138,7 @@ async def _call_llm(
     global _last_llm_error, _provider_last_call
     if not CALL_PLAN:
         _last_llm_error = ("no LLM provider configured — set GROQ_API_KEY / "
-                           "GEMINI_API_KEY / CEREBRAS_API_KEY / MISTRAL_API_KEY")
+                           "CEREBRAS_API_KEY / OPENROUTER_API_KEY")
         logger.error(_last_llm_error)
         return None
 

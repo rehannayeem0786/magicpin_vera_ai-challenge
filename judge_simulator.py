@@ -27,14 +27,14 @@ except ImportError:
 # Your bot's URL (where your bot is running)
 BOT_URL = "https://magicpinveraai-challenge.vercel.app"
 
-# Choose your LLM provider: "openai", "anthropic", "gemini", "deepseek", "groq", "ollama", "openrouter", "mistral"
-LLM_PROVIDER = "mistral"
+# Your LLM provider for scoring: "groq" (recommended — free, fast, 70b)
+LLM_PROVIDER = "groq"
 
 # Your API key (paste your key here, or leave empty if using .env)
-LLM_API_KEY = os.getenv("MISTRAL_API_KEY", "")  # <-- PUT YOUR API KEY HERE OR IN .env
+LLM_API_KEY = os.getenv("GROQ_API_KEY", "")  # <-- PUT YOUR API KEY HERE OR IN .env
 
-# Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
-LLM_MODEL = "open-mistral-nemo"  # <-- Optional: specify model or leave empty for default
+# Model to use (leave empty for default, or specify like "llama-3.3-70b-versatile")
+LLM_MODEL = "llama-3.3-70b-versatile"  # <-- Optional: specify model or leave empty for default
 
 # For Ollama only: local server URL
 OLLAMA_URL = "http://localhost:11434"

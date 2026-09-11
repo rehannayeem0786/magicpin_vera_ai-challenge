@@ -19,8 +19,7 @@ Context Extractor ──→ Derived insights + SPECIFICITY ANCHORS
         │                review quotes, slots, offer prices — never raw JSON)
         ↓
 LLM Composer ──→ Multi-provider priority chain (all OpenAI-compatible):
-        │          Groq llama-3.3-70b → Gemini 2.5 Flash → Cerebras 70b →
-        │          OpenRouter → Mistral medium/large/nemo
+        │          Groq llama-3.3-70b → Cerebras 70b → OpenRouter
         │          (per-provider RPM pacing, adaptive tier/outage disable,
         │           per-model timeout cap; survives any single provider failing)
         ↓
@@ -75,7 +74,7 @@ Each trigger kind targets 2-3 of these levers:
 
 ### Tradeoffs
 
-1. **Multi-provider chain over a single vendor**: Composition priority is Groq `llama-3.3-70b` → Gemini 2.5 Flash → Cerebras 70b → OpenRouter → Mistral. This directly targets the judge's burst profile (10 req/sec, up to 20 actions/tick): a single free-tier vendor's 1-req/sec ceiling turns that load into 429s and fallback copy — the #1 composition-score killer. All providers are OpenAI-compatible, so one call path serves them; per-provider RPM pacing, adaptive disable on tier/auth failures, and per-model timeout caps keep the chain alive through any single provider failing.
+1. **Multi-provider chain over a single vendor**: Composition priority is Groq `llama-3.3-70b` → Cerebras `llama-3.3-70b` → OpenRouter (DeepSeek). This directly targets the judge's burst profile (10 req/sec, up to 20 actions/tick): a single free-tier vendor's 1-req/sec ceiling turns that load into 429s and fallback copy — the #1 composition-score killer. All providers are OpenAI-compatible, so one call path serves them; per-provider RPM pacing, adaptive disable on tier/auth failures, and per-model timeout caps keep the chain alive through any single provider failing.
 
 2. **In-memory state vs persistent storage**: The working state lives in in-memory dicts for speed, backed by a shared Upstash Redis blob (`state_store.py`) when deployed serverless — every request hydrates from and merge-saves into Redis, so parallel instances share one truth (context version-merge prevents lost pushes; atomic SETNX claims prevent double-sends). `/v1/teardown` wipes both memory and Redis for §11 compliance.
 
@@ -121,7 +120,7 @@ The repo already contains the serverless adapter (`api/index.py` + `vercel.json`
 
 1. Push this repo to GitHub.
 2. On [vercel.com](https://vercel.com): **Add New… → Project → Import** the repo (framework preset: **Other**; root dir: repo root).
-3. **Settings → Environment Variables** → add `MISTRAL_API_KEY` (Production) — this must never be committed to git. For full serverless state sharing, also add `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` from a free [Upstash](https://upstash.com) Redis database (without them the bot runs memory-only per instance).
+3. **Settings → Environment Variables** → add `GROQ_API_KEY` (free — [console.groq.com](https://console.groq.com)), optionally `CEREBRAS_API_KEY` and `OPENROUTER_API_KEY` — these must never be committed to git. For full serverless state sharing, also add `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` from a free [Upstash](https://upstash.com) Redis database (without them the bot runs memory-only per instance).
 4. Deploy → your base URL is `https://<project-name>.vercel.app`.
 5. Smoke test before submitting the URL:
    ```bash
@@ -133,7 +132,7 @@ The repo already contains the serverless adapter (`api/index.py` + `vercel.json`
 
 ### Option B — Always-on host (guaranteed in-memory state)
 
-Render / Railway / Fly.io: start command `python bot.py` (binds `0.0.0.0`, respects `BOT_PORT`), set `MISTRAL_API_KEY` in the platform's env settings. No cold-start state loss.
+Render / Railway / Fly.io: start command `python bot.py` (binds `0.0.0.0`, respects `BOT_PORT`), set `GROQ_API_KEY` (and optional `CEREBRAS_API_KEY`/`OPENROUTER_API_KEY`) in the platform's env settings. No cold-start state loss.
 
 ## Setup
 
@@ -145,18 +144,14 @@ python -m venv .venv
 pip install -r requirements.txt
 
 # Configure LLM access (.env):
-# MISTRAL_API_KEY=your_key_here      # at least one provider required
-#
-# Recommended (all free, OpenAI-compatible — composer uses them in priority order):
-# GROQ_API_KEY=your_groq_key         # console.groq.com — llama-3.3-70b, ~1k tok/s
-# GEMINI_API_KEY=your_gemini_key     # aistudio.google.com — gemini-2.5-flash
-# CEREBRAS_API_KEY=your_cerebras_key # cloud.cerebras.ai — llama-3.3-70b, 2k+ tok/s
+# GROQ_API_KEY=your_groq_key         # console.groq.com — llama-3.3-70b, ~1k tok/s (free)
+# CEREBRAS_API_KEY=your_cerebras_key # cloud.cerebras.ai — llama-3.3-70b, 2k+ tok/s (free)
 # OPENROUTER_API_KEY=your_or_key     # openrouter.ai — paid insurance, cheap
 #
 # Optional overrides:
 # GROQ_MODELS=llama-3.3-70b-versatile,llama-3.1-8b-instant
-# GEMINI_MODELS=gemini-2.5-flash,gemini-2.0-flash
-# MISTRAL_MODEL=mistral-medium-latest
+# CEREBRAS_MODELS=llama-3.3-70b
+# OPENROUTER_MODELS=deepseek/deepseek-chat-v3-0324:free,deepseek/deepseek-chat-v3-0324
 # LLM_BUDGET_S=24
 # BOT_PORT=8080
 #
@@ -203,7 +198,7 @@ python verify_submission.py --strict
 
 ## Tech Stack
 
-- **LLM**: Multi-provider priority chain (all OpenAI-compatible): Groq `llama-3.3-70b` → Google `gemini-2.5-flash` → Cerebras `llama-3.3-70b` → OpenRouter → Mistral `medium/large/nemo`
+- **LLM**: Multi-provider priority chain (all OpenAI-compatible): Groq `llama-3.3-70b` → Cerebras `llama-3.3-70b` → OpenRouter `deepseek-chat`
 - **Framework**: FastAPI + Uvicorn
 - **HTTP Client**: httpx (async)
 - **Shared state**: Upstash Redis (REST) with in-memory fallback — version-merged blob + atomic suppression claims across serverless instances

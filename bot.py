@@ -10,7 +10,7 @@ Exposes 5 endpoints per the testing brief:
   GET  /v1/metadata  — bot identity
 
 Architecture:
-  Mistral LLM chain (medium primary → large → nemo) for composition
+  Multi-provider LLM chain (groq → cerebras → openrouter) for composition
   Trigger-specific prompt routing for 15+ trigger kinds
   Conversation state machine for multi-turn handling
   Post-composition validation for quality assurance
@@ -203,7 +203,7 @@ async def metadata():
     return {
         "team_name": "Vera Pro",
         "team_members": ["AI Challenge Participant"],
-        "model": f"{PRIMARY_MODEL} (multi-provider priority chain: groq → gemini → cerebras → openrouter → mistral)",
+        "model": f"{PRIMARY_MODEL} (multi-provider priority chain: groq → cerebras → openrouter)",
         "approach": "4-context composition framework with trigger-specific prompt routing, "
                     "specificity-anchor anti-hallucination engine, validate→LLM-repair→"
                     "deterministic-repair pipeline, conversation state machine for multi-turn, "
