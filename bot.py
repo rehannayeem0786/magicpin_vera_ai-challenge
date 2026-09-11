@@ -203,7 +203,7 @@ async def metadata():
     return {
         "team_name": "Vera Pro",
         "team_members": ["AI Challenge Participant"],
-        "model": f"{PRIMARY_MODEL} via Mistral API (fallback chain: mistral-large → mistral-nemo)",
+        "model": f"{PRIMARY_MODEL} (multi-provider priority chain: groq → gemini → cerebras → openrouter → mistral)",
         "approach": "4-context composition framework with trigger-specific prompt routing, "
                     "specificity-anchor anti-hallucination engine, validate→LLM-repair→"
                     "deterministic-repair pipeline, conversation state machine for multi-turn, "

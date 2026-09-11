@@ -30,33 +30,106 @@ from validators import (
 logger = logging.getLogger("vera_pro")
 
 # ─────────────────────────────────────────────────────────────────────
-# LLM Client — Mistral API
+# LLM Client — multi-provider, OpenAI-compatible, priority chain
+#
+# Priority: Groq → Gemini → Cerebras → OpenRouter → Mistral → (local)
+# Every provider below exposes an OpenAI-compatible chat-completions
+# endpoint, so one code path serves them all. The chain survives any
+# single provider's outage, quota exhaustion, or rate-limit burst —
+# which is exactly what happens during the judge's 10-req/sec harness.
+# Configure any subset via env vars; the plan is built from what exists.
 # ─────────────────────────────────────────────────────────────────────
 
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 _env_model = os.getenv("MISTRAL_MODEL", "").strip()
-# Chain order: medium is primary — measured ~0.9-3s vs large's instability
-# (2026-08: mistral-large-latest hung 60s+ platform-side, see probe logs).
-# medium → large → nemo keeps frontier quality in the chain while
-# guaranteeing a sub-10s composition in the healthy path.
-MODEL_CHAIN = [m for m in [
-    _env_model or "mistral-medium-latest",
-    "mistral-large-latest",
-    "open-mistral-nemo",
-] if m]
-PRIMARY_MODEL = MODEL_CHAIN[0]
-MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 
 # Whole-request budget — endpoints must respond within 30s
 LLM_BUDGET_S = float(os.getenv("LLM_BUDGET_S", "24"))
 
-# Adaptive model management (free-tier friendly):
-# - a model returning 403 tier_not_allowed is disabled for the process
-#   lifetime (deterministic per API key — never retry it)
-# - a global minimum call interval paces us under 1-req/sec free-tier limits
+# Adaptive model management:
+# - a (provider, model) returning 403 tier_not_allowed is disabled for the
+#   process lifetime (deterministic per API key — never retry it)
+# - pacing is per provider (each free tier has its own RPM ceiling)
 _model_disabled: set[str] = set()
-_MIN_CALL_INTERVAL_S = float(os.getenv("LLM_MIN_INTERVAL_S", "1.0"))
-_last_call_ts = 0.0
+_provider_last_call: dict[str, float] = {}
+_last_llm_error: str = ""
+
+
+def _build_call_plan() -> list[dict]:
+    """Flattened, priority-ordered call plan over all configured providers.
+
+    Each entry: {label, base, key, model, min_interval}
+    Order = copy-quality priority under the judge's burst load.
+    """
+    plan: list[dict] = []
+
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if groq_key:
+        groq_models = [m.strip() for m in os.getenv(
+            "GROQ_MODELS", "llama-3.3-70b-versatile,llama-3.1-8b-instant"
+        ).split(",") if m.strip()]
+        for m in groq_models:
+            plan.append({
+                "label": f"groq:{m}", "base": "https://api.groq.com/openai/v1",
+                "key": groq_key, "model": m,
+                "min_interval": float(os.getenv("GROQ_MIN_INTERVAL_S", "2.2")),
+            })
+
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if gemini_key:
+        gemini_models = [m.strip() for m in os.getenv(
+            "GEMINI_MODELS", "gemini-2.5-flash,gemini-2.0-flash"
+        ).split(",") if m.strip()]
+        for m in gemini_models:
+            plan.append({
+                "label": f"gemini:{m}",
+                "base": "https://generativelanguage.googleapis.com/v1beta/openai",
+                "key": gemini_key, "model": m,
+                "min_interval": float(os.getenv("GEMINI_MIN_INTERVAL_S", "6.5")),
+            })
+
+    cerebras_key = os.getenv("CEREBRAS_API_KEY", "").strip()
+    if cerebras_key:
+        cerebras_models = [m.strip() for m in os.getenv(
+            "CEREBRAS_MODELS", "llama-3.3-70b"
+        ).split(",") if m.strip()]
+        for m in cerebras_models:
+            plan.append({
+                "label": f"cerebras:{m}", "base": "https://api.cerebras.ai/v1",
+                "key": cerebras_key, "model": m,
+                "min_interval": float(os.getenv("CEREBRAS_MIN_INTERVAL_S", "2.2")),
+            })
+
+    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if or_key:
+        or_models = [m.strip() for m in os.getenv(
+            "OPENROUTER_MODELS", "deepseek/deepseek-chat-v3-0324:free"
+        ).split(",") if m.strip()]
+        for m in or_models:
+            plan.append({
+                "label": f"openrouter:{m}", "base": "https://openrouter.ai/api/v1",
+                "key": or_key, "model": m,
+                "min_interval": float(os.getenv("OPENROUTER_MIN_INTERVAL_S", "1.0")),
+            })
+
+    if MISTRAL_API_KEY:
+        mistral_models = [m.strip() for m in [
+            _env_model or "mistral-medium-latest",
+            "mistral-large-latest",
+            "open-mistral-nemo",
+        ] if m.strip()]
+        for m in mistral_models:
+            plan.append({
+                "label": f"mistral:{m}", "base": "https://api.mistral.ai/v1",
+                "key": MISTRAL_API_KEY, "model": m,
+                "min_interval": float(os.getenv("LLM_MIN_INTERVAL_S", "1.05")),
+            })
+
+    return plan
+
+
+CALL_PLAN = _build_call_plan()
+PRIMARY_MODEL = (CALL_PLAN[0]["label"] if CALL_PLAN else "none-configured")
 
 # Last LLM failure signature — surfaced in the fallback rationale so the
 # exact failure mode (bad key / 401 / timeout / egress error) is visible
@@ -71,31 +144,33 @@ async def _call_llm(
     budget_s: float = LLM_BUDGET_S,
     max_tokens: int = 500,
 ) -> str | None:
-    """Call Mistral API trying each model in MODEL_CHAIN within a time budget."""
-    global _last_llm_error, _last_call_ts
-    if not MISTRAL_API_KEY:
-        _last_llm_error = "no MISTRAL_API_KEY configured"
-        logger.error("No MISTRAL_API_KEY configured!")
+    """Try every provider/model in CALL_PLAN within a time budget.
+
+    Survives single-provider outages, tier blocks, and rate-limit bursts:
+    each (provider, model) that hard-fails is disabled for the process
+    lifetime, and pacing is per provider (each free tier has its own RPM).
+    """
+    global _last_llm_error, _provider_last_call
+    if not CALL_PLAN:
+        _last_llm_error = ("no LLM provider configured — set GROQ_API_KEY / "
+                           "GEMINI_API_KEY / CEREBRAS_API_KEY / MISTRAL_API_KEY")
+        logger.error(_last_llm_error)
         return None
 
-    headers = {
-        "Authorization": f"Bearer {MISTRAL_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
     started = time.monotonic()
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(budget_s)) as client:
-        for model in MODEL_CHAIN:
-            if model in _model_disabled:
-                continue  # tier-blocked earlier — skip silently
+        for entry in CALL_PLAN:
+            label = entry["label"]
+            if label in _model_disabled:
+                continue  # tier-blocked / auth-dead earlier — skip silently
             remaining = budget_s - (time.monotonic() - started)
             if remaining < 4.0:
                 _last_llm_error = "LLM time budget exhausted"
-                logger.warning("LLM time budget exhausted; stopping model chain")
+                logger.warning("LLM time budget exhausted; stopping call plan")
                 break
             body = {
-                "model": model,
+                "model": entry["model"],
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -103,55 +178,62 @@ async def _call_llm(
                 "temperature": 0.2,
                 "max_tokens": max_tokens,
             }
+            headers = {
+                "Authorization": f"Bearer {entry['key']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
             for attempt in range(retries + 1):
                 try:
-                    # Per-model cap: no single hanging model may consume the
-                    # whole budget — the next chain model must always get a turn.
+                    # Per-entry cap: no single hanging provider may consume
+                    # the whole budget — the next one must always get a turn.
                     call_timeout = max(4.0, min(remaining, budget_s, budget_s * 0.45))
-                    # Free-tier pacing: >= _MIN_CALL_INTERVAL_S between calls
-                    wait = _MIN_CALL_INTERVAL_S - (time.monotonic() - _last_call_ts)
+                    # Per-provider pacing (free-tier RPM ceilings differ)
+                    wait = entry["min_interval"] - (
+                        time.monotonic() - _provider_last_call.get(label, 0.0)
+                    )
                     if wait > 0:
                         await asyncio.sleep(wait)
-                    _last_call_ts = time.monotonic()
+                    _provider_last_call[label] = time.monotonic()
                     resp = await client.post(
-                        MISTRAL_URL, headers=headers, json=body,
-                        timeout=call_timeout,
+                        f"{entry['base']}/chat/completions", headers=headers,
+                        json=body, timeout=call_timeout,
                     )
                     if resp.status_code == 200:
                         content = resp.json()["choices"][0]["message"]["content"]
                         elapsed = time.monotonic() - started
-                        logger.info(f"LLM OK via {model} in {elapsed:.1f}s")
+                        logger.info(f"LLM OK via {label} in {elapsed:.1f}s")
                         _last_llm_error = ""
                         return content
                     elif resp.status_code == 401:
-                        _last_llm_error = "401 auth failed — invalid API key"
-                        logger.error("Mistral auth failed (401) — check API key")
-                        return None
+                        _model_disabled.add(label)
+                        _last_llm_error = f"{label} 401 — invalid API key, disabled"
+                        logger.error(f"{label} auth failed (401) — disabled")
+                        break  # next provider
                     elif resp.status_code == 403:
                         # Deterministic per-key signal (tier_not_allowed):
-                        # disable this model for the whole process lifetime.
-                        _model_disabled.add(model)
-                        _last_llm_error = f"{model} 403 tier-blocked — auto-disabled"
-                        logger.error(f"{model} unavailable in subscription tier — "
+                        # disable for the process lifetime, try next provider.
+                        _model_disabled.add(label)
+                        _last_llm_error = f"{label} 403 tier-blocked — auto-disabled"
+                        logger.error(f"{label} unavailable in subscription tier — "
                                      f"disabled for process lifetime")
-                        break  # next model in chain
+                        break  # next provider
                     elif resp.status_code == 429:
-                        _last_llm_error = f"{model} 429 rate limited"
-                        logger.warning(f"{model} rate limited")
-                        import asyncio
+                        _last_llm_error = f"{label} 429 rate limited"
+                        logger.warning(f"{label} rate limited (attempt {attempt + 1})")
                         await asyncio.sleep(0.8)
-                        continue  # retry same model once
+                        continue  # retry same entry once
                     else:
-                        _last_llm_error = f"{model} HTTP {resp.status_code}: {resp.text[:80]}"
-                        logger.warning(f"{model} error {resp.status_code}: {resp.text[:150]}")
-                        break  # fall to next model in chain
+                        _last_llm_error = f"{label} HTTP {resp.status_code}: {resp.text[:80]}"
+                        logger.warning(f"{label} error {resp.status_code}: {resp.text[:150]}")
+                        break  # fall to next provider in the plan
                 except (httpx.TimeoutException, httpx.ReadTimeout):
-                    _last_llm_error = f"{model} timeout after {call_timeout:.0f}s"
-                    logger.warning(f"{model} timeout after {call_timeout:.0f}s")
-                    break  # tighter budget — move to next model immediately
+                    _last_llm_error = f"{label} timeout after {call_timeout:.0f}s"
+                    logger.warning(f"{label} timeout after {call_timeout:.0f}s")
+                    break  # tighter budget — move to next provider immediately
                 except Exception as e:
-                    _last_llm_error = f"{model} {type(e).__name__}: {str(e)[:80]}"
-                    logger.warning(f"{model} request error: {e}")
+                    _last_llm_error = f"{label} {type(e).__name__}: {str(e)[:80]}"
+                    logger.warning(f"{label} request error: {e}")
                     break
 
     return None

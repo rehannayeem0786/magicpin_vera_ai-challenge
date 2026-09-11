@@ -170,17 +170,32 @@ def extract_customer_brief(customer: dict) -> dict | None:
 
 
 def find_relevant_digest_item(trigger: dict, category: dict) -> dict | None:
-    """Find the digest item referenced by a research_digest trigger."""
+    """Find the digest item referenced by a research_digest trigger.
+
+    Preference order:
+    1. The exact digest item pinned by the trigger payload (top_item_id)
+    2. The NEWEST digest item by publication date / id — post-submission
+       injected digest items carry newer dates than the seed set, so
+       freshness-first maximizes the Phase-3 adaptation bonus (the judge
+       scores whether the bot uses freshly injected context, not stale ones).
+    """
     payload = trigger.get("payload", {})
     top_item_id = payload.get("top_item_id", "")
+    digest = category.get("digest", []) or []
 
-    for item in category.get("digest", []):
+    for item in digest:
         if item.get("id") == top_item_id:
             return item
 
-    # If no specific ID match, return the first digest item
-    digest = category.get("digest", [])
-    return digest[0] if digest else None
+    if not digest:
+        return None
+
+    def _freshness_key(item: dict) -> tuple:
+        # date field when present (ISO strings sort correctly), else id —
+        # ids embed week numbers (d_2026W17_...) so they sort chronologically.
+        return (str(item.get("date", "")), str(item.get("id", "")))
+
+    return max(digest, key=_freshness_key)
 
 
 def compute_dormancy_days(merchant: dict) -> int:

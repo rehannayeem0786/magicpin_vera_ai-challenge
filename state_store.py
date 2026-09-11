@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from typing import Any
 
 import httpx
@@ -36,8 +37,19 @@ REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
 STATE_KEY = "vera:state:v1"
 CLAIM_PREFIX = "vera:sup:"
-CLAIM_TTL_S = 2 * 60 * 60  # suppression claims live 2h max
+CLAIM_TTL_S = 2 * 60 * 60        # suppression claims live 2h max
+STATE_TTL_S = 3 * 60 * 60        # whole state auto-expires 3h after last write
+STALE_AFTER_S = 4 * 60 * 60      # older than this = a previous session; reset
 REDIS_TIMEOUT_S = 3.0
+
+# Per-instance snapshot cache: the judge's Phase-1 warmup pushes 255
+# contexts at up to 10 req/sec — a 2s-fresh snapshot avoids a GET+SET
+# round-trip per push while staying merge-safe (the merge is additive
+# per-key with version comparison, so a slightly stale snapshot can
+# never erase another instance's writes).
+_SNAPSHOT: dict | None = None
+_SNAPSHOT_AT = 0.0
+_SNAPSHOT_TTL_S = 2.0
 
 _ENABLED = bool(REDIS_URL and REDIS_TOKEN)
 
@@ -89,13 +101,25 @@ def _claim_key(suppression_key: str) -> str:
 
 async def load_blob() -> dict | None:
     """Fetch the shared state blob. None on any failure / not configured."""
+    global _SNAPSHOT, _SNAPSHOT_AT
     if not _ENABLED:
         return None
+    now = time.monotonic()
+    if _SNAPSHOT is not None and (now - _SNAPSHOT_AT) < _SNAPSHOT_TTL_S:
+        return _SNAPSHOT
     try:
         result = await _cmd("GET", STATE_KEY)
-        if not result:
-            return {}
-        return json.loads(result)
+        blob = json.loads(result) if result else {}
+        # Stale-session reset: a judge session from hours ago must never
+        # pollute a fresh run (leftover claims would suppress new triggers,
+        # old conversations would poison anti-repetition checks).
+        updated_at = blob.get("updated_at", 0) if isinstance(blob, dict) else 0
+        if blob and (not updated_at or (time.time() - updated_at) > STALE_AFTER_S):
+            logger.info("Shared state is stale or legacy — treating as fresh session")
+            blob = {}
+        _SNAPSHOT = blob
+        _SNAPSHOT_AT = now
+        return blob
     except Exception as e:
         logger.warning(f"Redis load failed ({type(e).__name__}); using local state")
         return None
@@ -103,17 +127,26 @@ async def load_blob() -> dict | None:
 
 async def save_blob(local_blob: dict) -> None:
     """
-    Merge-save: re-read remote, keep the higher version per context key,
-    let the local writer win for conversations / sent_bodies it touched.
-    Prevents a long-running tick from clobbering a context push that
-    landed on another instance mid-composition.
+    Merge-save: re-read remote (snapshot-cached), keep the higher version
+    per context key, let the local writer win for conversations /
+    sent_bodies it touched. Prevents a long-running tick from clobbering
+    a context push that landed on another instance mid-composition.
+    The blob carries a 3h TTL so state evaporates between judge sessions.
     """
+    global _SNAPSHOT, _SNAPSHOT_AT
     if not _ENABLED:
         return
     try:
         remote = await load_blob() or {}
+        local_blob = dict(local_blob)
+        local_blob["updated_at"] = time.time()
         merged = _merge(remote, local_blob)
-        await _cmd("SET", STATE_KEY, json.dumps(merged, ensure_ascii=False))
+        await _cmd(
+            "SET", STATE_KEY, json.dumps(merged, ensure_ascii=False),
+            "EX", STATE_TTL_S,
+        )
+        _SNAPSHOT = merged
+        _SNAPSHOT_AT = time.monotonic()
     except Exception as e:
         logger.warning(f"Redis save failed ({type(e).__name__}); state kept locally")
 
@@ -177,12 +210,15 @@ async def release_suppression(suppression_key: str) -> None:
 
 async def wipe_remote() -> int:
     """Delete the state blob and every claim key. Returns keys removed."""
+    global _SNAPSHOT, _SNAPSHOT_AT
     if not _ENABLED:
         return 0
     try:
         keys = await _cmd("KEYS", f"{CLAIM_PREFIX}*") or []
         commands = [["DEL", STATE_KEY]] + [["DEL", k] for k in keys]
         results = await _pipeline(commands)
+        _SNAPSHOT = None
+        _SNAPSHOT_AT = 0.0
         return sum(1 for r in (results or []) if r and r > 0)
     except Exception as e:
         logger.warning(f"Redis wipe failed: {type(e).__name__}")
