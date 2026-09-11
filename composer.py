@@ -53,68 +53,202 @@ _provider_last_call: dict[str, float] = {}
 _last_llm_error: str = ""
 
 
-def _build_call_plan() -> list[dict]:
-    """Flattened, priority-ordered call plan over all configured providers.
+# Provider definitions — discovery-based so model-ID rotation never breaks
+# the chain (catalogs rotate: hardcoded IDs 404 within months, which is what
+# crashed the original submission). Model resolution is lazy + cached:
+#   1. explicit pins via {PROVIDER}_MODELS env (used verbatim)
+#   2. else live catalog discovery from GET /models, best match by
+#      `prefer` keywords (earlier = better), `avoid` keywords filtered
+#   3. else legacy static default (only if discovery fails)
+# On HTTP 404 (model rotated out mid-session): the model is marked failed,
+# the catalog is re-fetched, and the next chain entry resolves fresh.
+_PROVIDER_DEFS = [
+    {
+        "name": "groq",
+        "env": "GROQ_API_KEY",
+        "base": "https://api.groq.com/openai/v1",
+        "models_env": "GROQ_MODELS",
+        "min_interval": float(os.getenv("GROQ_MIN_INTERVAL_S", "2.2")),
+        "prefer": ["gpt-oss-120b", "qwen3.6", "qwen3.8", "gpt-oss-20b", "qwen", "70b"],
+        "avoid": ["orpheus", "whisper", "tts", "guard", "embed", "allam", "compound", "vision"],
+        "reasoning_effort": "low",  # gpt-oss family: cap hidden chain-of-thought
+        "defaults": ["llama-3.3-70b-versatile"],
+    },
+    {
+        "name": "gemini",
+        "env": "GEMINI_API_KEY",
+        "base": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "models_env": "GEMINI_MODELS",
+        "min_interval": float(os.getenv("GEMINI_MIN_INTERVAL_S", "6.5")),
+        "prefer": ["2.5", "flash", "2.0"],
+        "avoid": ["vision-"],
+        "defaults": ["gemini-2.5-flash"],
+    },
+    {
+        "name": "cerebras",
+        "env": "CEREBRAS_API_KEY",
+        "base": "https://api.cerebras.ai/v1",
+        "models_env": "CEREBRAS_MODELS",
+        "min_interval": float(os.getenv("CEREBRAS_MIN_INTERVAL_S", "2.2")),
+        "prefer": ["gpt-oss-120b", "qwen", "gemma", "70b"],
+        "avoid": [],
+        "reasoning_effort": "low",  # gpt-oss family: cap hidden chain-of-thought
+        "defaults": ["llama-3.3-70b"],
+    },
+    {
+        "name": "openrouter",
+        "env": "OPENROUTER_API_KEY",
+        "base": "https://openrouter.ai/api/v1",
+        "models_env": "OPENROUTER_MODELS",
+        "min_interval": float(os.getenv("OPENROUTER_MIN_INTERVAL_S", "1.0")),
+        "prefer": ["pro", "flash", "120b", "large", "max", "deepseek", "qwen"],
+        "avoid": ["vision"],
+        "reasoning_effort": "low",  # many free OR models are reasoning models too
+        "defaults": ["deepseek/deepseek-chat-v3-0324"],
+        "free_only": True,  # this deployment runs OpenRouter free models only
+    },
+]
 
-    Each entry: {label, base, key, model, min_interval}
-    Order = copy-quality priority under the judge's burst load.
+DISCOVERY_TTL_S = 6 * 60 * 60  # catalogs re-checked at most every 6h
+
+
+def _build_call_plan() -> list[dict]:
+    """One chain entry per configured provider (explicit pins may add more).
+
+    Model is resolved lazily per entry via live catalog discovery
+    (see _resolve_model), unless explicitly pinned via {PROVIDER}_MODELS.
     """
     plan: list[dict] = []
-
-    groq_key = os.getenv("GROQ_API_KEY", "").strip()
-    if groq_key:
-        groq_models = [m.strip() for m in os.getenv(
-            "GROQ_MODELS", "llama-3.3-70b-versatile,llama-3.1-8b-instant"
-        ).split(",") if m.strip()]
-        for m in groq_models:
-            plan.append({
-                "label": f"groq:{m}", "base": "https://api.groq.com/openai/v1",
-                "key": groq_key, "model": m,
-                "min_interval": float(os.getenv("GROQ_MIN_INTERVAL_S", "2.2")),
-            })
-
-    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if gemini_key:
-        gemini_models = [m.strip() for m in os.getenv(
-            "GEMINI_MODELS", "gemini-2.5-flash,gemini-2.0-flash"
-        ).split(",") if m.strip()]
-        for m in gemini_models:
-            plan.append({
-                "label": f"gemini:{m}",
-                "base": "https://generativelanguage.googleapis.com/v1beta/openai",
-                "key": gemini_key, "model": m,
-                "min_interval": float(os.getenv("GEMINI_MIN_INTERVAL_S", "6.5")),
-            })
-
-    cerebras_key = os.getenv("CEREBRAS_API_KEY", "").strip()
-    if cerebras_key:
-        cerebras_models = [m.strip() for m in os.getenv(
-            "CEREBRAS_MODELS", "llama-3.3-70b"
-        ).split(",") if m.strip()]
-        for m in cerebras_models:
-            plan.append({
-                "label": f"cerebras:{m}", "base": "https://api.cerebras.ai/v1",
-                "key": cerebras_key, "model": m,
-                "min_interval": float(os.getenv("CEREBRAS_MIN_INTERVAL_S", "2.2")),
-            })
-
-    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if or_key:
-        or_models = [m.strip() for m in os.getenv(
-            "OPENROUTER_MODELS", "deepseek/deepseek-chat-v3-0324:free"
-        ).split(",") if m.strip()]
-        for m in or_models:
-            plan.append({
-                "label": f"openrouter:{m}", "base": "https://openrouter.ai/api/v1",
-                "key": or_key, "model": m,
-                "min_interval": float(os.getenv("OPENROUTER_MIN_INTERVAL_S", "1.0")),
-            })
-
+    for defn in _PROVIDER_DEFS:
+        key = os.getenv(defn["env"], "").strip()
+        if not key:
+            continue
+        pinned = [m.strip() for m in os.getenv(defn["models_env"], "").split(",")
+                  if m.strip()]
+        base_entry = {
+            "provider": defn["name"], "base": defn["base"], "key": key,
+            "min_interval": defn["min_interval"], "pinned": pinned,
+            "prefer": defn["prefer"], "avoid": defn["avoid"],
+            "defaults": defn["defaults"], "free_only": defn.get("free_only", False),
+            "reasoning_effort": defn.get("reasoning_effort"),
+        }
+        if pinned:
+            for m in pinned:
+                entry = dict(base_entry)
+                entry["model"] = m
+                entry["label"] = f'{defn["name"]}:{m}'
+                plan.append(entry)
+        else:
+            entry = dict(base_entry)
+            entry["model"] = None  # resolved lazily via catalog discovery
+            entry["label"] = defn["name"]
+            plan.append(entry)
     return plan
 
 
 CALL_PLAN = _build_call_plan()
 PRIMARY_MODEL = (CALL_PLAN[0]["label"] if CALL_PLAN else "none-configured")
+
+# Runtime model resolution state (per provider)
+_discovered: dict[str, dict] = {}  # provider -> {models, failed, picked, fetched_at}
+
+
+def _pick_model(models: list[str], entry: dict, failed: set[str]) -> str | None:
+    """Pick the best available model for a provider from its live catalog."""
+    prefer = entry.get("prefer", [])
+    avoid = entry.get("avoid", [])
+    free_only = entry.get("free_only", False)
+    best, best_score = None, -1
+    for mid in models:
+        low = mid.lower()
+        if any(a in low for a in avoid):
+            continue
+        if failed and mid in failed:
+            continue
+        if free_only and not low.endswith(":free"):
+            continue
+        score = 1
+        if free_only and low.endswith(":free"):
+            score += 1000
+        for i, kw in enumerate(prefer):
+            if kw in low:
+                score += (len(prefer) - i) * 10
+                break
+        if score > best_score:
+            best, best_score = mid, score
+    return best
+
+
+async def _fetch_catalog(base: str, key: str) -> list[str]:
+    """Fetch the provider's live model catalog (OpenAI-compatible /models)."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            resp = await client.get(
+                f"{base}/models", headers={"Authorization": f"Bearer {key}"}
+            )
+        if resp.status_code != 200:
+            logger.warning(f"Model catalog fetch failed: HTTP {resp.status_code}")
+            return []
+        return [m.get("id", "") for m in resp.json().get("data", []) if m.get("id")]
+    except Exception as e:
+        logger.warning(f"Model catalog fetch error: {type(e).__name__}: {e}")
+        return []
+
+
+async def _resolve_model(entry: dict) -> str | None:
+    """Resolve the best current model for a chain entry (cached 6h).
+
+    Resolution order: pinned models verbatim (skipping known-dead ones),
+    then cached catalog pick, then live catalog discovery, then the
+    provider's legacy static default as a final fallback.
+    """
+    provider = entry["provider"]
+
+    if entry["pinned"]:
+        failed = _discovered.get(provider, {}).get("failed", set())
+        for m in entry["pinned"]:
+            if m not in failed:
+                return m
+        return None
+
+    now = time.monotonic()
+    cache = _discovered.get(provider)
+    if cache and (now - cache["fetched_at"]) < DISCOVERY_TTL_S:
+        remaining = [m for m in cache["models"] if m not in cache["failed"]]
+        if cache.get("picked") and cache["picked"] in remaining:
+            return cache["picked"]
+        picked = _pick_model(remaining, entry, set())
+        if picked:
+            cache["picked"] = picked
+        return picked
+
+    models = await _fetch_catalog(entry["base"], entry["key"])
+    cache = {"models": models, "failed": set(), "picked": None,
+             "fetched_at": now}
+    _discovered[provider] = cache
+    if models:
+        picked = _pick_model(models, entry, set())
+    else:
+        # Catalog empty/unreachable — legacy static default as last resort
+        picked = None
+        for m in entry.get("defaults", []):
+            picked = m
+            break
+        logger.warning(f"{provider}: catalog discovery failed — using default {picked}")
+    if picked:
+        cache["picked"] = picked
+    return picked
+
+
+def _mark_model_failed(provider: str, model: str) -> None:
+    """Model rotated out (404) — exclude it and force a fresh catalog fetch."""
+    cache = _discovered.get(provider)
+    if not cache:
+        cache = {"models": [], "failed": {model}, "picked": None, "fetched_at": 0.0}
+        _discovered[provider] = cache
+    cache["failed"].add(model)
+    cache["picked"] = None
+    cache["fetched_at"] = 0.0  # forces re-discovery on next resolve
 
 # Last LLM failure signature — surfaced in the fallback rationale so the
 # exact failure mode (bad key / 401 / timeout / egress error) is visible
@@ -127,7 +261,10 @@ async def _call_llm(
     user_prompt: str,
     retries: int = 1,
     budget_s: float = LLM_BUDGET_S,
-    max_tokens: int = 500,
+    # Headroom matters: reasoning models spend max_tokens on hidden
+    # chain-of-thought BEFORE the JSON body (measured: 498 reasoning tokens
+    # ate a 500-token budget -> 200-with-empty-content -> parse failure).
+    max_tokens: int = 900,
 ) -> str | None:
     """Try every provider/model in CALL_PLAN within a time budget.
 
@@ -154,8 +291,16 @@ async def _call_llm(
                 _last_llm_error = "LLM time budget exhausted"
                 logger.warning("LLM time budget exhausted; stopping call plan")
                 break
+            # Lazy model resolution: live catalog discovery (cached 6h) or
+            # explicit pins. None => provider has no usable model right now.
+            model = await _resolve_model(entry)
+            if model is None:
+                _model_disabled.add(label)
+                _last_llm_error = f"{label} — no usable model in catalog"
+                logger.warning(f"{label}: no usable model resolved — entry disabled")
+                continue
             body = {
-                "model": entry["model"],
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -163,6 +308,11 @@ async def _call_llm(
                 "temperature": 0.2,
                 "max_tokens": max_tokens,
             }
+            # Reasoning models (gpt-oss family) burn max_tokens on hidden
+            # chain-of-thought — cap the effort so the JSON body survives.
+            effort = entry.get("reasoning_effort")
+            if effort:
+                body["reasoning_effort"] = effort
             headers = {
                 "Authorization": f"Bearer {entry['key']}",
                 "Content-Type": "application/json",
@@ -185,7 +335,29 @@ async def _call_llm(
                         json=body, timeout=call_timeout,
                     )
                     if resp.status_code == 200:
-                        content = resp.json()["choices"][0]["message"]["content"]
+                        try:
+                            content = resp.json()["choices"][0]["message"]["content"] or ""
+                        except (KeyError, IndexError, ValueError):
+                            content = ""
+                        if not content.strip():
+                            # 200-with-empty-content: reasoning models can spend
+                            # the entire max_tokens on hidden chain-of-thought.
+                            # Retry once with a doubled budget (effort-cap may
+                            # be unsupported/ignored by this provider), then
+                            # fall through to the next provider.
+                            if attempt == 0 and body["max_tokens"] < 4000:
+                                body["max_tokens"] = min(body["max_tokens"] * 2, 4000)
+                                _last_llm_error = (
+                                    f"{label} 200 but empty content — retry 2x tokens"
+                                )
+                                logger.warning(
+                                    f"{label}: empty content — retrying with "
+                                    f"max_tokens={body['max_tokens']}"
+                                )
+                                continue
+                            _last_llm_error = f"{label} 200 but empty content"
+                            logger.warning(f"{label}: 200 with empty content — next provider")
+                            break
                         elapsed = time.monotonic() - started
                         logger.info(f"LLM OK via {label} in {elapsed:.1f}s")
                         _last_llm_error = ""
@@ -195,18 +367,40 @@ async def _call_llm(
                         _last_llm_error = f"{label} 401 — invalid API key, disabled"
                         logger.error(f"{label} auth failed (401) — disabled")
                         break  # next provider
-                    elif resp.status_code == 403:
-                        # Deterministic per-key signal (tier_not_allowed):
+                    elif resp.status_code in (402, 403):
+                        # Deterministic per-key signals:
+                        #   403 tier_not_allowed / 402 payment_required —
                         # disable for the process lifetime, try next provider.
                         _model_disabled.add(label)
-                        _last_llm_error = f"{label} 403 tier-blocked — auto-disabled"
-                        logger.error(f"{label} unavailable in subscription tier — "
+                        _last_llm_error = f"{label} HTTP {resp.status_code} — auto-disabled"
+                        logger.error(f"{label} unavailable (HTTP {resp.status_code}) — "
                                      f"disabled for process lifetime")
                         break  # next provider
+                    elif resp.status_code == 404:
+                        # Model rotated out of the provider's catalog — mark
+                        # failed + force re-discovery; next call self-heals.
+                        _mark_model_failed(entry["provider"], model)
+                        _last_llm_error = f"{label} 404 model rotated — re-discovering"
+                        logger.warning(
+                            f"{label}: model {model} gone (404) — re-discovering"
+                        )
+                        break  # next entry in the plan
+                    elif resp.status_code == 400 and "reasoning_effort" in body:
+                        # Provider/model rejects the reasoning_effort param —
+                        # retry the same entry once without it.
+                        body.pop("reasoning_effort", None)
+                        _last_llm_error = f"{label} 400 — retrying without reasoning_effort"
+                        logger.warning(f"{label}: 400 rejected reasoning_effort — retrying plain")
+                        continue
                     elif resp.status_code == 429:
                         _last_llm_error = f"{label} 429 rate limited"
-                        logger.warning(f"{label} rate limited (attempt {attempt + 1})")
-                        await asyncio.sleep(0.8)
+                        ra = resp.headers.get("retry-after", "")
+                        wait = 2.0
+                        if ra.replace(".", "", 1).isdigit():
+                            wait = min(5.0, max(1.0, float(ra)))
+                        logger.warning(f"{label} rate limited (attempt {attempt + 1}) — "
+                                       f"backoff {wait:.1f}s")
+                        await asyncio.sleep(wait)
                         continue  # retry same entry once
                     else:
                         _last_llm_error = f"{label} HTTP {resp.status_code}: {resp.text[:80]}"

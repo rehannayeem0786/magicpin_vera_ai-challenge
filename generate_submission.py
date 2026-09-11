@@ -110,11 +110,17 @@ async def main():
             print(f"  WARNING: Category {cat_slug} not found, skipping")
             continue
 
-        # Compose with retries — never ship fallback/error copy in the file.
-        # Fallback copy scores bottom-tier on all 5 rubric dimensions.
+        # Compose with patient retries — never ship fallback/error copy in the
+        # file. Fallback copy scores bottom-tier on all 5 rubric dimensions.
+        # Free-tier quotas reset per minute: back off hard between attempts.
         result = None
         last_err = None
-        for attempt in range(3):
+        backoffs = (30, 45, 60, 90)
+        for attempt in range(5):
+            if attempt:
+                pause = backoffs[min(attempt - 1, len(backoffs) - 1)]
+                print(f"  [RETRY {attempt}/4] waiting {pause}s for quota window...")
+                await asyncio.sleep(pause)
             try:
                 result = await composer.compose(category, merchant, trigger, customer)
                 last_err = None
@@ -123,7 +129,6 @@ async def main():
                 last_err = e
             if result and "Fallback composition" not in result.get("rationale", ""):
                 break
-            print(f"  [RETRY {attempt + 1}/2] fallback/error — recomposing...")
 
         if not result or "Fallback composition" in result.get("rationale", ""):
             print(f"  [FAIL] Still fallback after retries ({last_err})")
@@ -150,6 +155,9 @@ async def main():
             "suppression_key": result.get("suppression_key", ""),
             "rationale": result.get("rationale", ""),
         })
+
+        # Free-tier TPM windows: pace the whole batch, not just per-provider.
+        await asyncio.sleep(float(os.getenv("GEN_PAIR_INTERVAL_S", "15")))
 
     # Write submission.jsonl
     output_path = Path("submission.jsonl")

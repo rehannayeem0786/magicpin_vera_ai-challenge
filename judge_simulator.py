@@ -158,7 +158,7 @@ class ScoreResult:
 
 class LLMProvider(ABC):
     @abstractmethod
-    def complete(self, prompt: str, system: str = None) -> str:
+    def complete(self, prompt: str, system: str | None = None) -> str:
         pass
 
     @abstractmethod
@@ -174,7 +174,7 @@ class OpenAIProvider(LLMProvider):
     def name(self) -> str:
         return f"OpenAI ({self.model})"
 
-    def complete(self, prompt: str, system: str = None) -> str:
+    def complete(self, prompt: str, system: str | None = None) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -205,7 +205,7 @@ class AnthropicProvider(LLMProvider):
     def name(self) -> str:
         return f"Anthropic ({self.model})"
 
-    def complete(self, prompt: str, system: str = None) -> str:
+    def complete(self, prompt: str, system: str | None = None) -> str:
         body_dict = {"model": self.model, "max_tokens": 1500,
                      "messages": [{"role": "user", "content": prompt}]}
         if system:
@@ -230,7 +230,7 @@ class GeminiProvider(LLMProvider):
     def name(self) -> str:
         return f"Gemini ({self.model})"
 
-    def complete(self, prompt: str, system: str = None) -> str:
+    def complete(self, prompt: str, system: str | None = None) -> str:
         full_prompt = f"{system}\n\n{prompt}" if system else prompt
         body = json.dumps({
             "contents": [{"parts": [{"text": full_prompt}]}],
@@ -252,7 +252,7 @@ class DeepSeekProvider(LLMProvider):
     def name(self) -> str:
         return f"DeepSeek ({self.model})"
 
-    def complete(self, prompt: str, system: str = None) -> str:
+    def complete(self, prompt: str, system: str | None = None) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -277,7 +277,7 @@ class GroqProvider(LLMProvider):
     def name(self) -> str:
         return f"Groq ({self.model})"
 
-    def complete(self, prompt: str, system: str = None) -> str:
+    def complete(self, prompt: str, system: str | None = None) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -302,7 +302,7 @@ class MistralProvider(LLMProvider):
     def name(self) -> str:
         return f"Mistral ({self.model})"
 
-    def complete(self, prompt: str, system: str = None) -> str:
+    def complete(self, prompt: str, system: str | None = None) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -327,7 +327,7 @@ class OllamaProvider(LLMProvider):
     def name(self) -> str:
         return f"Ollama ({self.model})"
 
-    def complete(self, prompt: str, system: str = None) -> str:
+    def complete(self, prompt: str, system: str | None = None) -> str:
         full_prompt = f"{system}\n\n{prompt}" if system else prompt
         req = urlrequest.Request(
             f"{self.api_url}/api/generate",
@@ -348,7 +348,7 @@ class OpenRouterProvider(LLMProvider):
     def name(self) -> str:
         return f"OpenRouter ({self.model})"
 
-    def complete(self, prompt: str, system: str = None) -> str:
+    def complete(self, prompt: str, system: str | None = None) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -429,7 +429,7 @@ class BotClient:
         self.base_url = base_url.rstrip("/")
 
     def _request(self, method: str, path: str, timeout: int = 30,
-                 body_dict: Dict = None) -> Tuple[Optional[Dict], Optional[str], float]:
+                 body_dict: Dict | None = None) -> Tuple[Optional[Dict], Optional[str], float]:
         url = f"{self.base_url}{path}"
         start = time.time()
         body = json.dumps(body_dict).encode("utf-8") if body_dict else None
@@ -537,7 +537,7 @@ RESPOND ONLY WITH THIS EXACT JSON FORMAT:
         self.dataset = dataset
 
     def score(self, action: Dict, category: Dict, merchant: Dict,
-              trigger: Dict, customer: Dict = None) -> ScoreResult:
+              trigger: Dict, customer: Dict | None = None) -> ScoreResult:
         """Score a message and return detailed results."""
 
         body = action.get("body", "")
@@ -675,7 +675,7 @@ class JudgeSimulator:
         data, err, lat = self.client.metadata()
         if err:
             print_warn(f"metadata: {err}")
-        else:
+        elif data:
             print_success(f"metadata — Team: {data.get('team_name', '?')}, Model: {data.get('model', '?')}")
 
         print_section("CONTEXT PUSH")
@@ -707,7 +707,7 @@ class JudgeSimulator:
             print_fail(f"tick: {err}")
             return False
 
-        actions = data.get("actions", [])
+        actions = (data or {}).get("actions", [])
         print_info(f"Bot returned {len(actions)} action(s) ({lat:.0f}ms)")
 
         if not actions:
@@ -738,16 +738,16 @@ class JudgeSimulator:
                 print_fail(f"Error: {err}")
                 return False
 
-            action = data.get("action", "?")
+            action = (data or {}).get("action", "?")
 
             if action == "end":
                 print_success(f"Turn {i}: Bot ENDED — detected auto-reply pattern!")
                 return True
             elif action == "wait":
-                wait_s = data.get("wait_seconds", "?")
+                wait_s = (data or {}).get("wait_seconds", "?")
                 print_success(f"Turn {i}: Bot WAITING {wait_s}s")
             else:
-                body = data.get("body", "")[:50]
+                body = (data or {}).get("body", "")[:50]
                 print_warn(f"Turn {i}: Bot sent: \"{body}...\"")
 
         print_warn("Bot never ended after 4 auto-replies")
@@ -771,8 +771,8 @@ class JudgeSimulator:
             print_fail(f"Error: {err}")
             return False
 
-        action = data.get("action", "?")
-        body = data.get("body", "")
+        action = (data or {}).get("action", "?")
+        body = (data or {}).get("body", "")
 
         print_info(f"Bot action: {action}")
         if body:
@@ -809,8 +809,8 @@ class JudgeSimulator:
             print_fail(f"Error: {err}")
             return False
 
-        action = data.get("action", "?")
-        body = data.get("body", "")
+        action = (data or {}).get("action", "?")
+        body = (data or {}).get("body", "")
 
         print_info(f"Bot action: {action}")
 
@@ -863,7 +863,7 @@ class JudgeSimulator:
                 print_warn(f"Tick failed: {err}")
                 continue
 
-            actions = data.get("actions", [])
+            actions = (data or {}).get("actions", [])
             print_info(f"Batch {i//5 + 1}: {len(actions)} actions ({lat:.0f}ms)")
 
             for action in actions:
@@ -882,7 +882,11 @@ class JudgeSimulator:
         customer = self.dataset.customers.get(cid) if cid else None
         category = self.dataset.categories.get(merchant.get("category_slug", ""), {})
 
-        score = self.scorer.score(action, category, merchant, trigger, customer)
+        scorer = self.scorer
+        if scorer is None:
+            print_warn("No scorer configured — skipping score")
+            return
+        score = scorer.score(action, category, merchant, trigger, customer)
         self.all_scores.append(score)
 
         body = action.get("body", "")[:50]

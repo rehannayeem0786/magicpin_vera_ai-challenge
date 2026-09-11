@@ -19,9 +19,12 @@ Context Extractor ──→ Derived insights + SPECIFICITY ANCHORS
         │                review quotes, slots, offer prices — never raw JSON)
         ↓
 LLM Composer ──→ Multi-provider priority chain (all OpenAI-compatible):
-        │          Groq llama-3.3-70b → Cerebras 70b → OpenRouter
+        │          Groq → Cerebras → OpenRouter, with live catalog
+        │          discovery auto-resolving each provider's current best
+        │          model (hardcoded IDs 404 as catalogs rotate)
         │          (per-provider RPM pacing, adaptive tier/outage disable,
-        │           per-model timeout cap; survives any single provider failing)
+        │           per-model timeout cap, reasoning_effort=low for
+        │           reasoning models; survives any single provider failing)
         ↓
 Validator ──→ taboos, CTA shape/placement, send_as, markdown leak, length,
         │      repetition vs history, NUMERIC PROVENANCE (every ≥100 number
@@ -41,7 +44,7 @@ Conversation State Machine ──→ Auto-reply exit ≤2 turns, intent→action
 | **Specificity anchors engine** | Pre-computes verified fact-lines (CTR vs peer median, "+34% YoY thali searches", exact slot labels, ₹ offer prices) injected as *the only numbers the LLM may cite* | Maximum Specificity score with zero fabrication risk |
 | **Numeric provenance check** | Regex-extracts every ≥100 figure from output; any not found in the 4 context JSONs triggers an LLM repair re-write, then deterministic sentence-drop | Zero anti-hallucination penalties |
 | **Trigger-specific prompts + gold exemplars** | 15+ variants each ending in a pattern-to-emulate exemplar modeled on the brief's Appendix A/B | Consistent 10/10 message shape across kinds |
-| **Multi-provider LLM chain** | Priority chain across Groq `llama-3.3-70b` (~1k tok/s free) → Gemini 2.5 Flash (free) → Cerebras 70b (free, 2k+ tok/s) → OpenRouter → Mistral. Per-provider RPM pacing; adaptive disable on 403 `tier_not_allowed` / 401; per-model timeout cap; `strict=False` JSON parsing tolerates smaller models' pretty-printed output | Judge-burst-proof: Phase 2 fires 10 req/sec with up to 20 actions per tick — free-tier rate-limit collapse (the #1 composition-score killer) is engineered out |
+| **Multi-provider LLM chain** | Priority chain across Groq → Gemini → Cerebras → OpenRouter, whichever keys are set. Live catalog discovery (`GET /models`) auto-resolves each provider's current best model, so provider catalog rotation never 404s the chain. Per-provider RPM pacing; adaptive disable on 401 / 402 / 403 `tier_not_allowed` / empty-content; `reasoning_effort=low` on reasoning models (gpt-oss family burns `max_tokens` on hidden chain-of-thought — measured 498/500 reasoning tokens → empty body); Retry-After-aware 429 backoff; per-model timeout cap; `strict=False` JSON parsing tolerates smaller models' pretty-printed output | Judge-burst-proof: Phase 2 fires 10 req/sec with up to 20 actions per tick — free-tier rate-limit collapse (the #1 composition-score killer) is engineered out |
 | **Deadline-aware parallel tick** | Compositions run in bounded waves (max 4 concurrent) under a shared 26s guard; one action per merchant per tick (urgency-wins) | Survives 30s contract even with 50 triggers; no spam penalty |
 | **Shared-state store (serverless-safe)** | In-memory working cache backed by a version-merged Upstash Redis blob + atomic `SETNX` suppression claims — parallel judge requests hitting different serverless instances always see the full context state; no fragmentation, no double-sends | Every tick/reply runs with complete state; mid-test context injections are always picked up |
 | **Unicode hardening** | `normalize_text()` strips thin/nbsp/zero-width spaces from every outbound body — one live failure had an LLM-emitted `\u2009` crash a strict charmap codec | Judge parsers with strict encoders never see exotic Unicode |
@@ -74,7 +77,7 @@ Each trigger kind targets 2-3 of these levers:
 
 ### Tradeoffs
 
-1. **Multi-provider chain over a single vendor**: Composition priority is Groq `llama-3.3-70b` → Cerebras `llama-3.3-70b` → OpenRouter (DeepSeek). This directly targets the judge's burst profile (10 req/sec, up to 20 actions/tick): a single free-tier vendor's 1-req/sec ceiling turns that load into 429s and fallback copy — the #1 composition-score killer. All providers are OpenAI-compatible, so one call path serves them; per-provider RPM pacing, adaptive disable on tier/auth failures, and per-model timeout caps keep the chain alive through any single provider failing.
+1. **Multi-provider chain over a single vendor**: Composition priority is Groq → Gemini → Cerebras → OpenRouter (whichever keys are set), with live catalog discovery resolving each provider's current best model — hardcoded model IDs 404 within months as catalogs rotate, which is what silently degraded earlier submissions. This directly targets the judge's burst profile (10 req/sec, up to 20 actions/tick): a single free-tier vendor's per-minute token ceiling turns that load into 429s and fallback copy — the #1 composition-score killer. All providers are OpenAI-compatible, so one call path serves them; per-provider RPM pacing, adaptive disable on 401/402/403 (deterministic per-key billing/tier failures never retry), Retry-After-aware 429 backoff, reasoning-model hardening (`reasoning_effort=low` + generous `max_tokens` + empty-content retry — reasoning models spend the token budget on hidden chain-of-thought before the JSON body), and per-model timeout caps keep the chain alive through any single provider failing.
 
 2. **In-memory state vs persistent storage**: The working state lives in in-memory dicts for speed, backed by a shared Upstash Redis blob (`state_store.py`) when deployed serverless — every request hydrates from and merge-saves into Redis, so parallel instances share one truth (context version-merge prevents lost pushes; atomic SETNX claims prevent double-sends). `/v1/teardown` wipes both memory and Redis for §11 compliance.
 
@@ -144,14 +147,16 @@ python -m venv .venv
 pip install -r requirements.txt
 
 # Configure LLM access (.env):
-# GROQ_API_KEY=your_groq_key         # console.groq.com — llama-3.3-70b, ~1k tok/s (free)
-# CEREBRAS_API_KEY=your_cerebras_key # cloud.cerebras.ai — llama-3.3-70b, 2k+ tok/s (free)
-# OPENROUTER_API_KEY=your_or_key     # openrouter.ai — paid insurance, cheap
+# GROQ_API_KEY=your_groq_key         # console.groq.com — free tier
+# GEMINI_API_KEY=your_gemini_key     # aistudio.google.com — free tier (optional)
+# CEREBRAS_API_KEY=your_cerebras_key # cloud.cerebras.ai — free tier
+# OPENROUTER_API_KEY=your_or_key     # openrouter.ai — free models
 #
-# Optional overrides:
-# GROQ_MODELS=llama-3.3-70b-versatile,llama-3.1-8b-instant
-# CEREBRAS_MODELS=llama-3.3-70b
-# OPENROUTER_MODELS=deepseek/deepseek-chat-v3-0324:free,deepseek/deepseek-chat-v3-0324
+# Models are auto-discovered from each provider's live catalog (GET /models)
+# and re-verified every 6h — no hardcoded IDs to go stale. Optional pins:
+# GROQ_MODELS=openai/gpt-oss-120b
+# CEREBRAS_MODELS=gpt-oss-120b
+# OPENROUTER_MODELS=nex-agi/nex-n2.5-pro:free
 # LLM_BUDGET_S=24
 # BOT_PORT=8080
 #
@@ -198,7 +203,7 @@ python verify_submission.py --strict
 
 ## Tech Stack
 
-- **LLM**: Multi-provider priority chain (all OpenAI-compatible): Groq `llama-3.3-70b` → Cerebras `llama-3.3-70b` → OpenRouter `deepseek-chat`
+- **LLM**: Multi-provider priority chain (all OpenAI-compatible): Groq → Gemini → Cerebras → OpenRouter, with live catalog discovery auto-resolving current models
 - **Framework**: FastAPI + Uvicorn
 - **HTTP Client**: httpx (async)
 - **Shared state**: Upstash Redis (REST) with in-memory fallback — version-merged blob + atomic suppression claims across serverless instances
