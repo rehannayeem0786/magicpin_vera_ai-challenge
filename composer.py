@@ -184,10 +184,10 @@ async def _call_llm(
                 "Accept": "application/json",
             }
             for attempt in range(retries + 1):
+                # Per-entry cap, computed OUTSIDE the try so the timeout
+                # handler can always reference it (never possibly-unbound).
+                call_timeout = max(4.0, min(remaining, budget_s, budget_s * 0.45))
                 try:
-                    # Per-entry cap: no single hanging provider may consume
-                    # the whole budget — the next one must always get a turn.
-                    call_timeout = max(4.0, min(remaining, budget_s, budget_s * 0.45))
                     # Per-provider pacing (free-tier RPM ceilings differ)
                     wait = entry["min_interval"] - (
                         time.monotonic() - _provider_last_call.get(label, 0.0)
@@ -239,12 +239,13 @@ async def _call_llm(
     return None
 
 
-def _parse_json_response(text: str) -> dict | None:
+def _parse_json_response(text: str | None) -> dict | None:
     """Extract JSON from LLM response, handling markdown code blocks.
 
     strict=False tolerates literal control characters (raw newlines/tabs)
     inside string values — smaller chain models (e.g. open-mistral-nemo)
     emit pretty-printed JSON with unescaped newlines in the body strings.
+    Accepts None (LLM unavailable) and returns None in that case.
     """
     if not text:
         return None

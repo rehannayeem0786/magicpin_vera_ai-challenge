@@ -146,7 +146,7 @@ def extract_trigger_brief(trigger: dict) -> dict:
     }
 
 
-def extract_customer_brief(customer: dict) -> dict | None:
+def extract_customer_brief(customer: dict | None) -> dict | None:
     """Extract customer-specific info for customer-facing messages."""
     if not customer:
         return None
