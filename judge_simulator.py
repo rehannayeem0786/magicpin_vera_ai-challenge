@@ -564,7 +564,7 @@ Merchant: {merchant.get('identity', {}).get('name', 'unknown')}
 Owner: {merchant.get('identity', {}).get('owner_first_name', 'unknown')}
 Locality: {merchant.get('identity', {}).get('locality', 'unknown')}
 Languages: {merchant.get('identity', {}).get('languages', [])}
-Performance: views={merchant.get('performance', {}).get('views', '?')}, calls={merchant.get('performance', {}).get('calls', '?')}, ctr={merchant.get('performance', {}).get('ctr', '?')}
+Performance: {json.dumps(merchant.get('performance', {}), ensure_ascii=False)}
 Signals: {merchant.get('signals', [])}
 Active Offers: {[o.get('title') for o in merchant.get('offers', []) if o.get('status') == 'active']}
 

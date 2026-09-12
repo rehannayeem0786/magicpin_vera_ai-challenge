@@ -75,6 +75,23 @@ CONTEXT:
 
 DO NOT generic-ify. Anchor on specific numbers from the research.""",
 
+    "regulation_change": """## TRIGGER: Regulation Change / Compliance Deadline
+A new regulation affecting this merchant's category, with a compliance deadline.
+
+COMPOSE A MESSAGE THAT:
+- Opens with the merchant's name (use salutation style: {salutation})
+- Cites the specific regulation from the digest item (title, source, key requirement)
+- States the exact compliance deadline from the trigger payload
+- States the concrete action required and offers to handle it
+- Anchors on verifiable facts from the digest item — never invent rules or dates
+- Tone: factual, professional, helpful — a compliance alert, not an alarm
+
+CONTEXT:
+- Digest item (the regulation): {digest_item}
+- Trigger payload (incl. deadline_iso): {trigger_payload}
+- Active offers: {active_offers}
+- Merchant signals: {merchant_signals}""",
+
     "perf_spike": """## TRIGGER: Performance Spike
 This merchant's metrics showed a significant positive change recently.
 
