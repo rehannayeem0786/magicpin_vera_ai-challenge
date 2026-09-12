@@ -355,6 +355,7 @@ def enforce_cta_last(result: dict, trigger_kind: str = "") -> str:
 # ─────────────────────────────────────────────────────────────────────
 
 _NUMBER_RE = re.compile(r"₹\s?[0-9][0-9,]*|[0-9][0-9,]{1,}")
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _BENIGN_TOKENS = {"2026", "2025", "1800"}   # years / common constants
 
 
@@ -386,7 +387,44 @@ def provenance_issues(body: str, *contexts) -> list[str]:
         seen.add(tok.lower())
         if tok.lower() not in hay:
             problems.append(f"cited number '{raw}' not found in any provided context")
+
+    # Full ISO dates must appear verbatim in context — catches digit-
+    # transposed dates (2024-11-04 written for 2026-11-04) that pass the
+    # year-level number check because the bare year exists elsewhere.
+    seen_dates: set[str] = set()
+    for d in _ISO_DATE_RE.findall(body_flat):
+        if d in seen_dates:
+            continue
+        seen_dates.add(d)
+        if d not in hay:
+            problems.append(
+                f"cited date '{d}' not found in any provided context")
     return problems
+
+
+def repair_transposed_dates(body: str, *contexts) -> tuple[str, list[str]]:
+    """Fix digit-transposed ISO dates: when a cited date's MM-DD matches a
+    context date exactly but the year differs, correct it to the context
+    date (the LLM flipped digits; the underlying fact is real).
+    Returns (body, fixes_log)."""
+    hay = " ".join(_flat_text(c) for c in contexts if c)
+    ctx_dates = set(_ISO_DATE_RE.findall(hay))
+    if not ctx_dates:
+        return body, []
+    fixes: list[str] = []
+
+    def _sub(m) -> str:
+        d = m.group()
+        if d in ctx_dates:
+            return d
+        mmdd = d[5:]
+        for c in sorted(ctx_dates):
+            if c[5:] == mmdd and c[:4] != d[:4]:
+                fixes.append(f"corrected transposed date {d} -> {c}")
+                return c
+        return d
+
+    return _ISO_DATE_RE.sub(_sub, body), fixes
 
 
 def strip_unverified_numbers(
@@ -404,7 +442,7 @@ def strip_unverified_numbers(
     for p in problems:
         token = p.split("'")[1]
         probe = token.replace("₹", "").replace(",", "").strip()
-        if probe.isdigit():
+        if probe.isdigit() or _ISO_DATE_RE.fullmatch(probe):
             bad_tokens.append(probe)
     if not bad_tokens:
         return body, []
@@ -476,7 +514,13 @@ def repair_composition(
     if cta_fix:
         repairs.append(cta_fix)
 
-    # 6. Numeric provenance final net — drop sentences citing unverifiable
+    # 6. Date integrity — auto-correct digit-transposed ISO dates against
+    #    context before the strip net sees them
+    if provenance_contexts:
+        body, date_fixes = repair_transposed_dates(body, *provenance_contexts)
+        repairs.extend(date_fixes)
+
+    # 7. Numeric provenance final net — drop sentences citing unverifiable
     #    numbers (only when we wouldn't gut the message doing so)
     if provenance_contexts:
         cleaned, dropped = strip_unverified_numbers(body, *provenance_contexts)

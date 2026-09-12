@@ -94,13 +94,14 @@ Each trigger kind targets 2-3 of these levers:
 ### Verification & evidence
 
 ```bash
-# 48 offline tests — endpoint contracts, idempotency, teardown,
-# validators, provenance engine, intent/auto-reply detection
+# 51 offline tests — endpoint contracts, idempotency, teardown,
+# validators, provenance engine (incl. ISO-date integrity),
+# intent/auto-reply detection
 # (auto-reply regression includes: verbatim-duplicate isolation,
 #  zero-lexical-overlap paraphrase pools, human-chatter protection,
 #  merchant-level ladder across fresh conversation IDs, judge-replay
 #  action-intent gold-reply checks, graceful-close name handling)
-python -m pytest tests/test_offline.py -v          # → 48 passed
+python -m pytest tests/test_offline.py -v          # → 51 passed
 
 # Judge simulator — warmup, auto_reply, intent, hostile scenarios
 python judge_simulator.py                          # → 4/4 scenarios PASS

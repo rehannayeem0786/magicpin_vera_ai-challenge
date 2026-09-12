@@ -222,6 +222,30 @@ class TestNumericProvenance:
         from validators import provenance_issues
         assert provenance_issues("Recall set up in 2026 for you.", {}) == []
 
+    def test_transposed_date_repaired(self):
+        from validators import repair_transposed_dates
+        ctx = {"digest": [{"date": "2026-11-04",
+                           "title": "DCI circular on radiograph dose"}]}
+        body = "Circular dated 2024-11-04 revises dose limits. Reply YES."
+        fixed, log = repair_transposed_dates(body, ctx)
+        assert "2026-11-04" in fixed and "2024-11-04" not in fixed, fixed
+        assert log, log
+
+    def test_unmatchable_date_flagged(self):
+        from validators import provenance_issues
+        ctx = {"digest": [{"date": "2026-11-04"}]}
+        issues = provenance_issues(
+            "Circular dated 2030-01-05 applies now.", ctx)
+        assert any("2030-01-05" in i for i in issues), issues
+
+    def test_context_date_passes(self):
+        from validators import provenance_issues
+        ctx = {"digest": [{"date": "2026-11-04",
+                           "deadline": "2026-12-15"}]}
+        issues = provenance_issues(
+            "Dated 2026-11-04, comply by 2026-12-15.", ctx)
+        assert issues == [], issues
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Intent & auto-reply detection (conversation layer)

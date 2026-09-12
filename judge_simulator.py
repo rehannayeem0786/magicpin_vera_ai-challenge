@@ -559,6 +559,7 @@ RESPOND ONLY WITH THIS EXACT JSON FORMAT:
 Category: {category.get('slug', 'unknown')}
 Voice: {category.get('voice', {}).get('tone', 'unknown')}
 Taboos: {category.get('voice', {}).get('vocab_taboo', [])[:5]}
+Digest items (published research/compliance content the bot may cite): {json.dumps(category.get('digest', [])[:8], ensure_ascii=False)}
 
 Merchant: {merchant.get('identity', {}).get('name', 'unknown')}
 Owner: {merchant.get('identity', {}).get('owner_first_name', 'unknown')}
