@@ -33,7 +33,11 @@ Validator ──→ taboos, CTA shape/placement, send_as, markdown leak, length,
 Repair Loop ──→ LLM repair pass with issue feedback, then deterministic net:
         │        taboo-sentence removal, CTA append/reposition, send_as fix,
         │        fabricated-number sentence drop
-Conversation State Machine ──→ Auto-reply exit ≤2 turns, intent→action mode,
+Conversation State Machine ──→ Auto-reply exit ≤2 turns + merchant-level ladder
+                                (identical canned text across fresh conv IDs:
+                                flag prompt → wait 24h → end), intent→action mode
+                                with deterministic gold action-reply repair
+                                (never re-qualifies after commitment),
                                 hostile/not-interested graceful Hinglish close
 ```
 
@@ -48,8 +52,8 @@ Conversation State Machine ──→ Auto-reply exit ≤2 turns, intent→action
 | **Deadline-aware parallel tick** | Compositions run in bounded waves (max 4 concurrent) under a shared 26s guard; one action per merchant per tick (urgency-wins) | Survives 30s contract even with 50 triggers; no spam penalty |
 | **Shared-state store (serverless-safe)** | In-memory working cache backed by a version-merged Upstash Redis blob + atomic `SETNX` suppression claims — parallel judge requests hitting different serverless instances always see the full context state; no fragmentation, no double-sends | Every tick/reply runs with complete state; mid-test context injections are always picked up |
 | **Unicode hardening** | `normalize_text()` strips thin/nbsp/zero-width spaces from every outbound body — one live failure had an LLM-emitted `\u2009` crash a strict charmap codec | Judge parsers with strict encoders never see exotic Unicode |
-| **Auto-reply detection** | Canned-pattern regexes + verbatim repetition + **request-free filler pairs** (autoresponders paraphrase freely but never ask for prices/details/slots — two consecutive request-free merchant messages ⇒ exit ≤2 turns; humans who ask anything are always protected) | Passes replay/auto-reply probes first try |
-| **Intent transition hardening** | "I want to join", "count me in", "interested", Hinglish "kardo" → immediate action mode | Directly fixes production Vera's #1 handoff failure |
+| **Auto-reply detection** | Canned-pattern regexes + verbatim repetition + **request-free filler pairs** (autoresponders paraphrase freely but never ask for prices/details/slots — two consecutive request-free merchant messages ⇒ exit ≤2 turns; humans who ask anything are always protected) + **merchant-level ladder** (identical canned text replayed with fresh conversation IDs still accumulates per merchant: 1st → one flag prompt for the owner, 2nd → wait 24h, 3rd → end) | Passes replay/auto-reply probes first try |
+| **Intent transition hardening** | "I want to join", "count me in", "interested", Hinglish "kardo" → immediate action mode; deterministic repair rewrites any post-commitment reply that still qualifies into a self-contained gold action statement built from merchant data ("Drafting your … now — Reply CONFIRM…") | Directly fixes production Vera's #1 handoff failure; passes the judge's intent-transition action/qualify lexical check |
 | **Anti-repetition memory** | Per-merchant deque of last sent bodies fed into every new composition ("vary angle") | No verbatim-repeat penalties across ticks |
 | **Hindi-English craft rules** | English nouns/numbers + Hindi connectives per category `code_mix`, gender-neutral closes ("Theek hai…") | Higher merchant fit; no gendered-Hinglish slips |
 | **`/v1/teardown` privacy wipe** | Wipes contexts/conversations/dedup state on judge signal | §11 compliance demonstrated |
@@ -90,11 +94,13 @@ Each trigger kind targets 2-3 of these levers:
 ### Verification & evidence
 
 ```bash
-# 39 offline tests — endpoint contracts, idempotency, teardown,
+# 48 offline tests — endpoint contracts, idempotency, teardown,
 # validators, provenance engine, intent/auto-reply detection
 # (auto-reply regression includes: verbatim-duplicate isolation,
-#  zero-lexical-overlap paraphrase pools, human-chatter protection)
-python -m pytest tests/test_offline.py -v          # → 39 passed
+#  zero-lexical-overlap paraphrase pools, human-chatter protection,
+#  merchant-level ladder across fresh conversation IDs, judge-replay
+#  action-intent gold-reply checks, graceful-close name handling)
+python -m pytest tests/test_offline.py -v          # → 48 passed
 
 # Judge simulator — warmup, auto_reply, intent, hostile scenarios
 python judge_simulator.py                          # → 4/4 scenarios PASS

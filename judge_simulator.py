@@ -33,8 +33,11 @@ LLM_PROVIDER = "groq"
 # Your API key (paste your key here, or leave empty if using .env)
 LLM_API_KEY = os.getenv("GROQ_API_KEY", "")  # <-- PUT YOUR API KEY HERE OR IN .env
 
-# Model to use (leave empty for default, or specify like "llama-3.3-70b-versatile")
-LLM_MODEL = "llama-3.3-70b-versatile"  # <-- Optional: specify model or leave empty for default
+# Model to use (leave empty for default, or specify like "openai/gpt-oss-120b").
+# Catalogs rotate — llama-3.3-70b-versatile is gone from groq's free catalog;
+# gpt-oss-120b is verified live. Run with reasoning_effort=low (see GroqProvider)
+# so hidden chain-of-thought doesn't eat max_tokens.
+LLM_MODEL = "openai/gpt-oss-120b"  # <-- Optional: specify model or leave empty for default
 
 # For Ollama only: local server URL
 OLLAMA_URL = "http://localhost:11434"
@@ -272,7 +275,7 @@ class DeepSeekProvider(LLMProvider):
 class GroqProvider(LLMProvider):
     def __init__(self, api_key: str, model: str = ""):
         self.api_key = api_key
-        self.model = model or "llama-3.1-70b-versatile"
+        self.model = model or "openai/gpt-oss-120b"
 
     def name(self) -> str:
         return f"Groq ({self.model})"
@@ -286,8 +289,14 @@ class GroqProvider(LLMProvider):
         req = urlrequest.Request(
             "https://api.groq.com/openai/v1/chat/completions",
             data=json.dumps({"model": self.model, "messages": messages,
-                            "temperature": 0.2, "max_tokens": 1500}).encode("utf-8"),
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+                            "temperature": 0.2, "max_tokens": 1500,
+                            # Reasoning models burn max_tokens on hidden
+                            # chain-of-thought first — cap it so the scoring
+                            # completion survives (measured: 498/500 CoT).
+                            "reasoning_effort": "low"}).encode("utf-8"),
+            headers={"Authorization": f"Bearer {self.api_key}",
+                     "Content-Type": "application/json",
+                     "User-Agent": "VeraPro-JudgeSim/1.0"}
         )
         resp = urlrequest.urlopen(req, timeout=TIMEOUT_LLM)
         data = json.loads(resp.read().decode("utf-8"))
@@ -433,7 +442,9 @@ class BotClient:
         url = f"{self.base_url}{path}"
         start = time.time()
         body = json.dumps(body_dict).encode("utf-8") if body_dict else None
-        headers = {"Content-Type": "application/json"}
+        # Some providers (groq/Cloudflare edge) 403 Python-urllib's default
+        # User-Agent — always send a real client UA.
+        headers = {"Content-Type": "application/json", "User-Agent": "VeraPro-JudgeSim/1.0"}
         req = urlrequest.Request(url, data=body, method=method, headers=headers)
 
         try:

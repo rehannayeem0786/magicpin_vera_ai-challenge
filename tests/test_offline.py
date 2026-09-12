@@ -20,6 +20,8 @@ def _client():
     bot.contexts.clear()
     bot.conversations_mgr.conversations.clear()
     bot.used_suppression_keys.clear()
+    bot.sent_bodies.clear()
+    bot.autoresponder_memory.clear()
     return TestClient(bot.app)
 
 
@@ -432,3 +434,176 @@ class TestSpecificityAnchors:
             extract_specificity_anchors({}, {}, trigger, customer))
         assert "Wed 5 Nov, 6pm" in joined
         assert "lifetime visits" in joined
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Judge-replay scenarios (brief Example 4.1 / 4.2) — offline & deterministic
+# ─────────────────────────────────────────────────────────────────────
+
+AUTO_MSG = "Thank you for contacting us! Our team will respond shortly."
+COMMIT_MSG = "Ok lets do it. Whats next?"
+
+# Exactly the lexical contract judge_simulator.py applies to replies
+QUALIFYING = ["would you", "do you", "can you tell", "what if", "how about"]
+ACTIONING = ["done", "sending", "draft", "here", "confirm", "proceed", "next"]
+
+
+def _force_offline(monkeypatch):
+    """Make the composer deterministic (no LLM) regardless of env keys."""
+    import composer
+    monkeypatch.setattr(composer, "CALL_PLAN", [])
+
+
+def _post_reply(c, conv_id, mid, message, turn):
+    return c.post("/v1/reply", json={
+        "conversation_id": conv_id,
+        "merchant_id": mid,
+        "from_role": "merchant",
+        "message": message,
+        "received_at": "2026-04-26T10:00:00Z",
+        "turn_number": turn,
+    })
+
+
+class TestMerchantAutoReplyLadder:
+    """Example 4.1: judge replays the SAME canned auto-reply with a fresh
+    conversation_id every turn (conv_auto_1..4). Per-conversation counts
+    never accumulate — the merchant-level ladder must: flag → wait 24h → end."""
+
+    def test_flag_then_wait_then_end_across_fresh_convs(self, monkeypatch):
+        from validators import detect_auto_reply
+        assert detect_auto_reply(AUTO_MSG) is True  # preconditions
+
+        c = _client()
+        _force_offline(monkeypatch)
+        actions = []
+        for i in range(1, 5):
+            r = _post_reply(c, f"conv_auto_{i}", "m_ladder", AUTO_MSG, i + 1)
+            assert r.status_code == 200
+            actions.append(r.json())
+
+        assert actions[0]["action"] == "send"
+        assert "auto-reply" in actions[0]["body"].lower()
+
+        assert actions[1]["action"] == "wait"
+        assert actions[1]["wait_seconds"] == 86400
+
+        assert actions[2]["action"] == "end"
+        # 4th replay (if it ever came) stays ended
+        assert actions[3]["action"] == "end"
+
+    def test_human_question_never_triggers_ladder(self, monkeypatch):
+        c = _client()
+        _force_offline(monkeypatch)
+        for i in range(1, 4):
+            r = _post_reply(c, f"conv_human_{i}", "m_ladder2",
+                            "What is the price for the bridal package?",
+                            i + 1)
+            data = r.json()
+            assert data["action"] != "end", data
+            assert data["action"] == "send", data
+        import bot
+        assert bot.autoresponder_memory.get("m_ladder2", {}) == {}
+
+    def test_distinct_canned_texts_count_separately(self, monkeypatch):
+        """Two DIFFERENT canned texts = still 1st occurrence each → flag
+        prompts, not a premature exit."""
+        c = _client()
+        _force_offline(monkeypatch)
+        r1 = _post_reply(c, "cv1", "m_l3",
+                         "Thank you for contacting us! We will respond shortly.", 2)
+        r2 = _post_reply(c, "cv2", "m_l3",
+                         "Thanks for your message! Our team will reply soon.", 3)
+        assert r1.json()["action"] == "send"
+        assert r2.json()["action"] == "send"
+
+
+class TestActionIntentGoldReply:
+    """Example 4.2: after an explicit commitment the reply must be an
+    action statement (actioning word, no qualifying phrase) — exactly what
+    the judge simulator checks on the intent_transition scenario."""
+
+    def test_commitment_via_composer_fallback(self, monkeypatch):
+        c = _client()
+        _force_offline(monkeypatch)
+        r = _post_reply(c, "conv_intent_1", "m_acts", COMMIT_MSG, 2)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["action"] == "send"
+        body_lower = data["body"].lower()
+        assert any(w in body_lower for w in ACTIONING), data["body"]
+        assert not any(w in body_lower for w in QUALIFYING), data["body"]
+        assert "confirm" in body_lower
+        assert data["cta"] == "binary_confirm_cancel"
+
+    def test_self_contained_from_merchant_data(self, monkeypatch):
+        c = _client()
+        _force_offline(monkeypatch)
+        c.post("/v1/context", json={
+            "scope": "merchant", "context_id": "m_acts2", "version": 1,
+            "payload": {
+                "identity": {"name": "Studio11", "owner_first_name": "Lakshmi"},
+                "offers": [{"title": "Bridal Trial @ ₹999", "status": "active"}],
+            },
+            "delivered_at": "2026-04-26T10:00:00Z",
+        })
+        r = _post_reply(c, "conv_intent_2", "m_acts2", COMMIT_MSG, 3)
+        data = r.json()
+        assert data["action"] == "send"
+        assert "Lakshmi" in data["body"]
+        assert "Bridal Trial @ ₹999" in data["body"]
+        assert "CONFIRM" in data["body"]
+
+    def test_deterministic_repair_when_llm_qualifies(self, monkeypatch):
+        import bot
+        c = _client()
+        _force_offline(monkeypatch)
+
+        async def _qualifying_llm(conv_state, message, category, merchant):
+            return {"action": "send",
+                    "body": "Great! Would you like me to proceed with the details?",
+                    "cta": "open_ended",
+                    "rationale": "LLM slipped back into qualifying"}
+
+        monkeypatch.setattr(bot.composer, "compose_reply", _qualifying_llm)
+        r = _post_reply(c, "conv_intent_3", "m_acts3", COMMIT_MSG, 3)
+        data = r.json()
+        body_lower = data["body"].lower()
+        assert any(w in body_lower for w in ACTIONING), data["body"]
+        assert not any(w in body_lower for w in QUALIFYING), data["body"]
+
+
+class TestReplyGracefulCloses:
+    """The judge's hostile / intent / question scenarios often run standalone
+    with NO merchant context pushed — name-bearing reply templates must
+    degrade cleanly (no dangling " ." from an empty name)."""
+
+    def test_hostile_close_without_merchant_context(self, monkeypatch):
+        import bot
+        c = _client()
+        _force_offline(monkeypatch)
+        r = _post_reply(c, "cv_h1", "m_noc",
+                        "Get lost. Don't message me again.", 2)
+        data = r.json()
+        assert data["action"] == "send"
+        assert data["cta"] == "none"
+        assert data["body"].startswith("Sorry")
+        assert " ." not in data["body"], data["body"]
+        # ended conversations are cleaned up from the live map
+        assert bot.conversations_mgr.conversations.get("cv_h1") is None
+
+    def test_not_interested_close_without_merchant_context(self, monkeypatch):
+        c = _client()
+        _force_offline(monkeypatch)
+        r = _post_reply(c, "cv_n1", "m_noc", "Not interested, please stop", 2)
+        data = r.json()
+        assert data["body"].startswith("Koi baat nahi")
+        assert " ." not in data["body"], data["body"]
+
+    def test_question_fallback_without_merchant_context(self, monkeypatch):
+        c = _client()
+        _force_offline(monkeypatch)
+        r = _post_reply(c, "cv_q1", "m_noc", "What are your weekend timings?", 2)
+        data = r.json()
+        assert data["action"] == "send"
+        assert " ." not in data["body"], data["body"]

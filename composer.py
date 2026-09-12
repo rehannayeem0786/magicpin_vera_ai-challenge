@@ -823,11 +823,27 @@ If you cite any number, it must come from the context above or the conversation 
                 "rationale": f"Merchant signaled {intent}, graceful exit",
             }
         elif intent == "action_commit":
+            # Gold action reply (Example 4.2): a self-contained action
+            # statement built from merchant data — never another
+            # qualifying question after an explicit commitment.
+            name = merch.get("owner_first_name", merch.get("name", ""))
+            greet = f"{name}! " if name else ""
+            offers = merch.get("active_offers", []) or []
+            offer = ""
+            if offers:
+                first = offers[0]
+                offer = (first.get("title", "") if isinstance(first, dict)
+                         else str(first))
+            body = f"Done {greet}Drafting your WhatsApp now — 90 seconds."
+            if offer:
+                body += f" I'll feature {offer}."
+            body += " Reply CONFIRM to send it."
             return {
                 "action": "send",
-                "body": "Done! Working on it now. Will share the update shortly.",
-                "cta": "none",
-                "rationale": "Merchant committed to action, confirming execution",
+                "body": body,
+                "cta": "binary_confirm_cancel",
+                "rationale": ("Merchant committed to action; concrete next "
+                              "step + explicit CONFIRM gate"),
             }
         else:
             return {
